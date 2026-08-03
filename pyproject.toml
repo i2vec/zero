@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zero"
+version = "0.1.0"
+description = "0号机: a dual-agent (Researcher + Labwright) scientific experiment execution system"
+requires-python = ">=3.10"
+dependencies = [
+    "claude-agent-sdk>=0.2.0",
+    "pydantic>=2.0",
+    "httpx>=0.27",
+    "huggingface_hub>=0.20",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+zero = "zero.cli:main"
+capgw = "capgw.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["zero*", "capgw*"]
+
+[tool.setuptools.package-data]
+"zero.trace" = ["static/*", "static/vendor/*"]

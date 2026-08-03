@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>0号机 · Trace Viewer</title>
+<link rel="stylesheet" href="static/styles.css"/>
+</head>
+<body data-view="rendered">
+<div class="topbar">
+  <header>
+    <h1>0号机 · Trace</h1>
+    <span class="task" id="task">…</span>
+    <span class="spacer"></span>
+    <div class="seg" id="seg">
+      <button data-v="rendered">渲染</button>
+      <button data-v="raw">原始</button>
+      <button data-v="both">两者</button>
+    </div>
+    <span class="status" id="status"><span class="live-dot"></span>连接中</span>
+  </header>
+  <div class="colhead">
+    <div class="r" data-agent="researcher">Researcher <span class="cnt" id="rc">0</span></div>
+    <div class="l" data-agent="labwright">Labwright <span class="cnt" id="lc">0</span></div>
+    <div class="t" data-agent="teacher">Teacher <span class="cnt" id="tc">0</span></div>
+  </div>
+  <div class="legend" aria-label="颜色图例">
+    <span class="lg-group">侧条</span>
+    <span><i class="lg-bar orch"></i>生命周期</span>
+    <span><i class="lg-bar researcher"></i>Researcher</span>
+    <span><i class="lg-bar labwright"></i>Labwright</span>
+    <span><i class="lg-bar teacher"></i>Teacher</span>
+    <span class="lg-sep"></span>
+    <span class="lg-group">徽章</span>
+    <span><i class="lg-pill ok"></i>成功 / READY</span>
+    <span><i class="lg-pill decision"></i>待决策</span>
+    <span><i class="lg-pill fail"></i>失败</span>
+    <span><i class="lg-pill pending"></i>进行中</span>
+  </div>
+</div>
+
+<div id="app">
+  <aside class="spine-pane">
+    <div class="pane-label">交接脊柱</div>
+    <div id="spine"><div class="empty sm">等待事件…</div></div>
+    <button id="follow" class="follow" style="display:none">回到最新</button>
+  </aside>
+  <main class="detail-pane">
+    <div class="pane-label">段详情</div>
+    <div id="detail"><div class="empty">从左侧选择一段，或等待实时事件</div></div>
+  </main>
+</div>
+
+<script src="static/vendor/marked.min.js"></script>
+<script src="static/vendor/purify.min.js"></script>
+<script src="static/app.js"></script>
+</body>
+</html>
