@@ -5,6 +5,10 @@ Reads ``runs/<task_id>/trace/`` only:
 * **Model I/O** — ``researcher.jsonl`` / ``labwright.jsonl`` / ``teacher.jsonl``
 * **Layer 2 events** — ``events.jsonl`` (``turn:*`` mirrors skipped in the UI)
 
+SSE streams orchestration events plus **compact model turns**: each model event
+carries only the incremental ``turn_input`` and a lean ``output`` (no repeated
+full conversation history / tool schemas / duplicate ``raw``).
+
 Static front-end under ``static/``; this module serves ``/latest`` and ``/stream``.
 """
 
@@ -22,21 +26,69 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 _STATIC_DIR = Path(__file__).parent / "static"
+_INJECTED_USER_PREFIXES = (
+    "<system-reminder>",
+    "Available agent types for the Agent tool:",
+    "The following skills are available for use with the Skill tool:",
+    "As you answer the user's questions, you can use the following context:",
+    "IMPORTANT: this context may or may not be relevant to your task.",
+)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _list_runs(runs_dir: Path) -> list[dict[str, Any]]:
+    """Return runs under ``runs_dir``, newest first."""
+    if not runs_dir.is_dir():
+        return []
+    rows: list[dict[str, Any]] = []
+    for child in runs_dir.iterdir():
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        trace = child / "trace"
+        events = trace / "events.jsonl"
+        # Include dirs that look like runs (have trace/ or run.json / meta/).
+        if not (trace.is_dir() or (child / "run.json").is_file() or (child / "meta").is_dir()):
+            continue
+        mtime = 0.0
+        for p in (events, child / "run.json", child / "meta" / "task.json", child):
+            try:
+                mtime = max(mtime, p.stat().st_mtime)
+            except OSError:
+                continue
+        run_meta = _read_json(child / "run.json")
+        task_meta = _read_json(child / "meta" / "task.json")
+        status = (
+            run_meta.get("status")
+            or task_meta.get("task_status")
+            or ("live" if events.is_file() else "unknown")
+        )
+        agents = {
+            "researcher": (trace / "researcher.jsonl").is_file(),
+            "labwright": (trace / "labwright.jsonl").is_file(),
+            "teacher": (trace / "teacher.jsonl").is_file(),
+            "events": events.is_file(),
+        }
+        rows.append({
+            "task_id": child.name,
+            "status": status,
+            "mtime": mtime,
+            "agents": agents,
+            "backend": run_meta.get("backend") or task_meta.get("backend"),
+        })
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
 
 
 def _latest_task_id(runs_dir: Path) -> Optional[str]:
-    if not runs_dir.is_dir():
-        return None
-    candidates: list[tuple[float, str]] = []
-    for events in runs_dir.glob("*/trace/events.jsonl"):
-        try:
-            candidates.append((events.stat().st_mtime, events.parent.parent.name))
-        except OSError:
-            continue
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
+    rows = _list_runs(runs_dir)
+    return rows[0]["task_id"] if rows else None
 
 
 def _stream_sources(task_id: str, runs_dir: Path) -> list[tuple[str, Optional[str], Path]]:
@@ -137,6 +189,90 @@ def _parse_output(rec: dict[str, Any]) -> dict[str, Any]:
             "stop_reason": rr.get("stop_reason"), "raw": rr}
 
 
+def _parse_output_lean(rec: dict[str, Any]) -> dict[str, Any]:
+    """Output for SSE — drop ``raw`` (duplicates text / tool_calls)."""
+    out = _parse_output(rec)
+    out.pop("raw", None)
+    return out
+
+
+def _same_message(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    if a.get("role") != b.get("role"):
+        return False
+    ab = a.get("blocks") or []
+    bb = b.get("blocks") or []
+    if len(ab) != len(bb):
+        return False
+    for x, y in zip(ab, bb):
+        if x.get("type") != y.get("type") or x.get("text") != y.get("text"):
+            return False
+        if bool(x.get("is_error")) != bool(y.get("is_error")):
+            return False
+    return True
+
+
+def _without_injected_context(message: dict[str, Any]) -> dict[str, Any]:
+    if message.get("role") != "user":
+        return message
+    blocks = []
+    for block in message.get("blocks") or []:
+        text = str(block.get("text") or "").strip()
+        if any(text.startswith(p) for p in _INJECTED_USER_PREFIXES):
+            continue
+        blocks.append(block)
+    out = dict(message)
+    out["blocks"] = blocks
+    return out
+
+
+def _turn_input(previous: list[dict[str, Any]], messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Incremental delta used by chain view (matches former front-end logic)."""
+    common = 0
+    while (
+        common < len(previous)
+        and common < len(messages)
+        and _same_message(previous[common], messages[common])
+    ):
+        common += 1
+    delta = [m for m in messages[common:] if m.get("role") != "assistant"]
+    if not previous:
+        delta = [
+            m for m in (_without_injected_context(m) for m in delta)
+            if m.get("blocks")
+        ]
+    return delta
+
+
+def _compact_model_event(
+    agent: str,
+    index: int,
+    rec: dict[str, Any],
+    previous_messages: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Build a wire-efficient model SSE payload; return (event, new_previous)."""
+    parsed = _parse_input(rec)
+    messages = list(parsed.get("messages") or [])
+    turn = _turn_input(previous_messages, messages)
+    # Full conversation + tool schemas dominate payload size; ship meta + delta only.
+    # System prompt only on the first call for that agent (rarely needed later).
+    payload = {
+        "t": "model",
+        "agent": agent,
+        "ts": rec.get("ts"),
+        "index": index,
+        "api_type": rec.get("api_type"),
+        "input": {
+            "num_messages": parsed.get("num_messages", 0),
+            "num_tools": parsed.get("num_tools", 0),
+            "tool_names": parsed.get("tool_names") or [],
+            "system": (parsed.get("system") or "") if index == 0 else "",
+        },
+        "turn_input": turn,
+        "output": _parse_output_lean(rec),
+    }
+    return payload, messages
+
+
 def build_app(runs_dir: Path) -> FastAPI:
     runs_dir = Path(runs_dir)
 
@@ -145,7 +281,17 @@ def build_app(runs_dir: Path) -> FastAPI:
 
     @app.get("/")
     async def index() -> FileResponse:
+        """Run list — pick a task, then open its Segment Inspector."""
+        return FileResponse(_STATIC_DIR / "list.html")
+
+    @app.get("/trace")
+    async def trace_view() -> FileResponse:
+        """Detail viewer for one run (``?task_id=...``)."""
         return FileResponse(_STATIC_DIR / "index.html")
+
+    @app.get("/api/runs")
+    async def api_runs() -> JSONResponse:
+        return JSONResponse({"runs": _list_runs(runs_dir)})
 
     @app.get("/latest")
     async def latest() -> JSONResponse:
@@ -158,6 +304,9 @@ def build_app(runs_dir: Path) -> FastAPI:
         async def gen():
             pos: dict[Path, int] = {p: 0 for _, _, p in sources}
             idx = {"researcher": 0, "labwright": 0, "teacher": 0}
+            prev_msgs: dict[str, list[dict[str, Any]]] = {
+                "researcher": [], "labwright": [], "teacher": [],
+            }
             first = True
             while True:
                 if await request.is_disconnected():
@@ -189,13 +338,12 @@ def build_app(runs_dir: Path) -> FastAPI:
                         else:
                             i = idx[agent]
                             idx[agent] += 1
-                            batch.append((rec.get("ts", 0), {
-                                "t": "model", "agent": agent, "ts": rec.get("ts"), "index": i,
-                                "api_type": rec.get("api_type"),
-                                "input": _parse_input(rec), "output": _parse_output(rec),
-                            }))
-                if first:
-                    batch.sort(key=lambda x: x[0])  # chronological replay across files
+                            payload, prev_msgs[agent] = _compact_model_event(
+                                agent, i, rec, prev_msgs[agent],
+                            )
+                            batch.append((rec.get("ts", 0), payload))
+                if first or len(batch) > 1:
+                    batch.sort(key=lambda x: x[0])  # keep orch + model files chronologically aligned
                     first = False
                 for _, payload in batch:
                     yield f"data: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"

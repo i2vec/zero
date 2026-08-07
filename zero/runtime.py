@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from zero.capgw_runner import CapgwRunner
@@ -24,13 +25,14 @@ class RunRequest:
 
     prompt: str
     run_name: Optional[str] = None
-    max_turns: int = 60
+    max_turns: int = 1000
     export: bool = True
     preparer: Optional[ExternalTaskPreparer] = None
     mcp_server_factory: Optional[Callable[[Any, str, str], dict[str, Any]]] = None
     task_key: Optional[str] = None
     teacher_enabled: Optional[bool] = None
     hints: Optional[str] = None
+    task_package: Optional[Path] = None
 
 
 class ZeroRuntime:
@@ -76,6 +78,7 @@ class ZeroRuntime:
                     task_key=request.task_key,
                     teacher_enabled=request.teacher_enabled,
                     hints=request.hints,
+                    task_package=request.task_package,
                 )
             finally:
                 orchestrator.close()

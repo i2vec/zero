@@ -12,11 +12,13 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from zero.config import Config
+from zero.labwright.inventory import collect_and_write_inventory
 from zero.labwright.resolver import Resolver
 from zero.labwright.verifier import Verifier, normalize_dist
 from zero.protocol.manifest import (
@@ -63,6 +65,33 @@ def _text(obj: Any) -> dict:
     return {"content": [{"type": "text", "text": payload}]}
 
 
+def _persist_environment_baseline(ctx: "LabwrightContext", manifest: EnvironmentManifest) -> None:
+    """Persist the clean, pre-Researcher snapshot immediately.
+
+    Completion later replaces this record with the resolved image URL, but
+    writing it here preserves the snapshot id even if a run is interrupted.
+    """
+    path = ctx.config.run_dir(ctx.task_id) / "environment.json"
+    payload = {
+        "schema_version": 1,
+        "backend": ctx.manager.backend,
+        "snapshot_scope": "environment_baseline",
+        "snapshot_timing": "Labwright publish_manifest before handoff to Researcher",
+        "status": "snapshot_submitted",
+        "manifest": manifest.model_dump(mode="json"),
+        "image": {
+            "digest": manifest.image_digest,
+            "status": "submitted" if manifest.image_digest else "unavailable",
+            "url": None,
+        },
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 @dataclass
 class LabwrightContext:
     """Mutable per-request (and longer-lived) state the labenv tools mutate."""
@@ -77,6 +106,10 @@ class LabwrightContext:
     request_id: str = ""
     spec: Optional[EnvironmentSpec] = None
     sandbox_id: Optional[str] = None
+    env_sandbox_id: Optional[str] = None
+    exp_sandbox_id: Optional[str] = None
+    last_environment_id: Optional[str] = None
+    last_pip_freeze: list[str] = field(default_factory=list)
     collected: dict[str, CachedResource] = field(default_factory=dict)  # "model:name" -> res
     source_overrides: dict[str, str] = field(default_factory=dict)
     pending_decision: Optional[DecisionRequest] = None
@@ -99,14 +132,18 @@ def build_labenv_server(ctx: LabwrightContext):
 
     @tool(
         "create_sandbox",
-        "创建实验 Sandbox。可选 mounts：[{kind,name,version,host_path}]。"
-        "返回 sandbox_id 与 workspace。",
+        "创建 **env** Sandbox（默认）用于装依赖与验证；publish_manifest 后会自动再开 "
+        "**exp** Sandbox 交给 Researcher。"
+        "中途加包请重新 create_sandbox(role=env) 再建环境，不要在 exp 上 commit。"
+        "可选 mounts：[{kind,name,version,host_path}]。返回 sandbox_id 与 workspace。",
         {
             "python_version": str,
             "cpu_count": int,
             "memory_gb": int,
             "gpu_count": int,
             "mounts": list,
+            "role": str,
+            "base_image": str,
         },
     )
     async def create_sandbox(args):
@@ -121,28 +158,60 @@ def build_labenv_server(ctx: LabwrightContext):
         python = args.get("python_version") or (
             ctx.spec.base_environment.python if ctx.spec else "3.11"
         )
+        role = (args.get("role") or "env").strip().lower()
+        if role not in ("env", "exp"):
+            role = "env"
+        if role == "exp":
+            return _text({
+                "ok": False,
+                "error": (
+                    "do not create exp sandboxes directly; create_sandbox(role=env), "
+                    "install+verify, then publish_manifest (it spawns the exp sandbox)"
+                ),
+            })
+        base_image = (args.get("base_image") or "").strip() or ctx.config.docker_base_image
+        # Prefer last frozen image URL for mid-run env revisions when available.
+        if not args.get("base_image"):
+            img_path = ctx.config.run_dir(ctx.task_id) / "environment" / "image.json"
+            if img_path.is_file():
+                try:
+                    prev = json.loads(img_path.read_text(encoding="utf-8"))
+                    if prev.get("url"):
+                        base_image = prev["url"]
+                    elif prev.get("reference"):
+                        base_image = prev["reference"]
+                except (OSError, json.JSONDecodeError):
+                    pass
         handle = await asyncio.to_thread(
             lambda: ctx.manager.create(
                 ctx.task_id,
-                base_image=ctx.config.docker_base_image,
+                base_image=base_image,
                 mounts=mounts,
                 cpu_count=int(args.get("cpu_count") or (ctx.spec.compute.cpu_count if ctx.spec else 2)),
                 memory_gb=int(args.get("memory_gb") or (ctx.spec.compute.memory_gb if ctx.spec else 8)),
                 gpu_count=int(args.get("gpu_count") or (ctx.spec.compute.gpu_count if ctx.spec else 0)),
                 python_version=str(python),
+                role="env",
             )
         )
         ctx.sandbox_id = handle.sandbox_id
+        ctx.env_sandbox_id = handle.sandbox_id
         ctx.emit("labwright", "sandbox_created", {
             "request_id": ctx.request_id, "sandbox_id": handle.sandbox_id,
             "backend": handle.backend, "workspace": handle.workspace_path,
+            "role": "env",
         })
         return _text({
             "ok": True,
             "sandbox_id": handle.sandbox_id,
+            "role": "env",
             "workspace": handle.workspace_path,
             "backend": handle.backend,
             "resource_paths": handle.resource_paths,
+            "note": (
+                "This is an env sandbox (scratch). Install/verify here; "
+                "publish_manifest will spawn a clean exp sandbox for the Researcher."
+            ),
         })
 
     @tool(
@@ -309,8 +378,9 @@ def build_labenv_server(ctx: LabwrightContext):
 
     @tool(
         "publish_manifest",
-        "验证通过后发布 EnvironmentManifest，将本请求标记为 ENVIRONMENT_READY。"
-        "可选传入 packages/tools 覆盖列表；默认从当前 spec + collected 构建。",
+        "验证通过后：冻结 **env** Sandbox（inventory + image commit），再自动生成干净的 "
+        "**exp** Sandbox；返回给 Researcher 的是 exp sandbox_id。"
+        "禁止对 exp 调用本工具。可选传入 packages/tools 覆盖列表。",
         {
             "sandbox_id": str,
             "packages": list,
@@ -392,8 +462,26 @@ def build_labenv_server(ctx: LabwrightContext):
                 "verification": ver.model_dump(exclude_none=True),
             })
 
-        digest = await asyncio.to_thread(ctx.manager.snapshot, sid)
-        manifest = EnvironmentManifest(
+        role = ctx.manager.role_of(sid) or "env"
+        if role == "exp":
+            return _text({
+                "ok": False,
+                "error": (
+                    f"sandbox {sid} is an experiment sandbox; freeze/commit is only "
+                    "allowed on env sandboxes. create_sandbox(role=env), apply changes, "
+                    "then publish_manifest again."
+                ),
+            })
+
+        # Wipe workspace so LBG image commit does not bake experiment files.
+        await asyncio.to_thread(ctx.manager.prepare_env_for_freeze, sid)
+
+        try:
+            digest = await asyncio.to_thread(ctx.manager.snapshot, sid)
+        except RuntimeError as exc:
+            return _text({"ok": False, "error": str(exc)})
+
+        env_manifest = EnvironmentManifest(
             task_id=ctx.task_id,
             experiment_id=ctx.spec.experiment_id,
             sandbox_id=sid,
@@ -408,27 +496,128 @@ def build_labenv_server(ctx: LabwrightContext):
             image_digest=digest,
             package_lock={n: e.version for n, e in packages.items()},
         )
+
+        # Probe freeze for degraded spawn + inventory before spawning exp.
+        pip_freeze: list[str] = []
+        try:
+            fr = await asyncio.to_thread(
+                ctx.manager.exec, sid, "python3 -m pip freeze 2>/dev/null", 120,
+            )
+            if fr.exit_code == 0:
+                pip_freeze = [
+                    ln.strip() for ln in (fr.stdout or "").splitlines()
+                    if ln.strip() and not ln.startswith("#")
+                ]
+        except Exception:  # noqa: BLE001
+            pip_freeze = []
+        ctx.last_pip_freeze = pip_freeze
+
+        parent_mounts = []
+        parent_spec = ctx.manager._specs.get(sid)  # noqa: SLF001
+        if parent_spec is not None:
+            parent_mounts = list(parent_spec.mounts)
+
+        try:
+            exp_handle = await asyncio.to_thread(
+                lambda: ctx.manager.spawn_experiment_sandbox(
+                    task_id=ctx.task_id,
+                    env_sandbox_id=sid,
+                    digest=digest,
+                    mounts=parent_mounts,
+                    python_version=ctx.spec.base_environment.python,
+                    cpu_count=ctx.spec.compute.cpu_count if ctx.spec else 2,
+                    memory_gb=ctx.spec.compute.memory_gb if ctx.spec else 8,
+                    gpu_count=ctx.spec.compute.gpu_count if ctx.spec else 0,
+                    pip_freeze=pip_freeze,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _text({
+                "ok": False,
+                "error": f"env frozen but failed to spawn exp sandbox: {exc}",
+                "env_sandbox_id": sid,
+                "image_digest": digest,
+            })
+
+        # Researcher-facing manifest points at the exp sandbox.
+        manifest = env_manifest.model_copy(deep=True)
+        manifest.sandbox_id = exp_handle.sandbox_id
+        manifest.workspace = exp_handle.workspace_path
+
         as_added = bool(args.get("as_resource_added"))
         status = EnvironmentStatus.RESOURCE_ADDED if as_added else EnvironmentStatus.ENVIRONMENT_READY
         msg = args.get("message") or (
-            "资源已加入当前 Sandbox（Manifest 已更新）" if as_added else "环境已就绪"
+            "资源已加入；已从干净环境镜像生成新的实验 Sandbox"
+            if as_added else
+            "环境已就绪（env 已冻结；已生成干净 exp Sandbox）"
         )
         ctx.response = EnvironmentResponse(
-            status=status, request_id=ctx.request_id, sandbox_id=sid,
+            status=status, request_id=ctx.request_id, sandbox_id=exp_handle.sandbox_id,
             manifest=manifest, message=msg,
-            detail={"ts": time.time()},
+            detail={
+                "ts": time.time(),
+                "env_sandbox_id": sid,
+                "exp_sandbox_id": exp_handle.sandbox_id,
+                "spawn_mode": exp_handle.spawn_mode,
+            },
         )
-        ctx.sandbox_manifest[sid] = manifest
+        ctx.sandbox_manifest[sid] = env_manifest
+        ctx.sandbox_manifest[exp_handle.sandbox_id] = manifest
         ctx.sandbox_spec[sid] = ctx.spec
-        ctx.sandbox_id = sid
+        ctx.sandbox_spec[exp_handle.sandbox_id] = ctx.spec
+        ctx.env_sandbox_id = sid
+        ctx.exp_sandbox_id = exp_handle.sandbox_id
+        ctx.sandbox_id = exp_handle.sandbox_id
+
+        try:
+            base_image = ""
+            if ctx.spec is not None and ctx.spec.base_environment is not None:
+                base_image = (
+                    f"python:{ctx.spec.base_environment.python}"
+                    if ctx.spec.base_environment.python
+                    else ""
+                )
+            inventory = collect_and_write_inventory(
+                run_dir=ctx.config.run_dir(ctx.task_id),
+                manager=ctx.manager,
+                manifest=env_manifest,
+                backend=ctx.manager.backend,
+                base_image=base_image or "",
+                scope="clean_baseline",
+                spawn_mode=exp_handle.spawn_mode,
+                env_sandbox_id=sid,
+                exp_sandbox_id=exp_handle.sandbox_id,
+            )
+            ctx.last_environment_id = inventory.environment_id
+            exp_handle.environment_id = inventory.environment_id
+        except Exception as exc:  # noqa: BLE001
+            ctx.emit("labwright", "inventory_failed", {"error": str(exc)[:500]})
+            _persist_environment_baseline(ctx, env_manifest)
+
         ctx.emit("labwright", "manifest_published", {
-            "request_id": ctx.request_id, "sandbox_id": sid, "status": status.value,
+            "request_id": ctx.request_id,
+            "sandbox_id": exp_handle.sandbox_id,
+            "env_sandbox_id": sid,
+            "status": status.value,
+            "spawn_mode": exp_handle.spawn_mode,
+            "environment_id": ctx.last_environment_id,
         })
         return _text({
             "ok": True,
             "status": status.value,
-            "sandbox_id": sid,
+            "sandbox_id": exp_handle.sandbox_id,
+            "env_sandbox_id": sid,
+            "exp_sandbox_id": exp_handle.sandbox_id,
+            "spawn_mode": exp_handle.spawn_mode,
+            "environment_id": ctx.last_environment_id,
             "summary": manifest.researcher_summary(),
+            "environment_md": str(
+                ctx.config.run_dir(ctx.task_id) / "environment" / "environment.md"
+            ),
+            "note": (
+                "Hand the Researcher the exp sandbox_id only. "
+                "Do not ask them to write code into the env sandbox."
+            ),
         })
 
     @tool(

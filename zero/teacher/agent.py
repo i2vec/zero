@@ -14,18 +14,28 @@ from typing import Callable, Optional
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-from zero.claude_runtime import RunResult, TurnEvent, build_env, consume_message, skill_plugins
+from zero.claude_runtime import (
+    HOST_TOOLS,
+    RunResult,
+    TurnEvent,
+    allow_all,
+    build_env,
+    consume_message,
+    skill_plugins,
+)
 from zero.config import Config
 from zero.teacher.prompts import TEACHER_SYSTEM
 from zero.teacher.tools import TeacherContext, build_hintbank_server
 
 _ALLOWED_TOOLS = [
-    # Hint bank only. No file/shell/sandbox access: the Researcher's workspace
-    # and trajectory stay invisible, so the Teacher answers the question it was
-    # asked rather than quietly taking over the experiment.
+    *HOST_TOOLS,
     "mcp__hintbank__read_hint_bank",
+    "mcp__hintbank__read_grade_result",
     "mcp__hintbank__give_hint",
     "mcp__hintbank__amend_task_statement",
+    "mcp__hintbank__amend_grader",
+    "mcp__hintbank__amend_task_and_grader",
+    "mcp__hintbank__declare_no_change",
     "mcp__hintbank__decline",
 ]
 
@@ -40,7 +50,7 @@ class TeacherAgent:
         task_id: str,
         ctx: TeacherContext,
         on_event: Optional[Callable[[TurnEvent], None]] = None,
-        max_turns: int = 12,
+        max_turns: int = 1000,
         cwd: Optional[str] = None,
     ):
         self._config = config
@@ -56,12 +66,13 @@ class TeacherAgent:
         session_key = f"{self._task_id}/trace/teacher"
         plugins = skill_plugins(self._config.teacher_skills_dir)
         return ClaudeAgentOptions(
+            tools={"type": "preset", "preset": "claude_code"},
             system_prompt=TEACHER_SYSTEM,
             allowed_tools=_ALLOWED_TOOLS,
-            disallowed_tools=["Bash", "Read", "Write", "Edit", "Glob", "Grep",
-                              "WebFetch", "WebSearch", "NotebookEdit"],
+            disallowed_tools=[],
             mcp_servers={"hintbank": build_hintbank_server(self._ctx)},
             permission_mode="acceptEdits",
+            can_use_tool=allow_all,
             cwd=self._cwd,
             env=build_env(self._config, session_key),
             model=self._config.model,

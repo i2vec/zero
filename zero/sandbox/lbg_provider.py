@@ -26,7 +26,7 @@ Images carry fixed version tags), avoiding the ``:latest`` churn lbg warns about
 Command mapping (SandboxProvider method -> CLI)
 -----------------------------------------------
     create_sandbox  -> template create (if missing) + ``lbg sdbx create <tpl> --json``
-    exec            -> ``lbg sdbx exec --timeout <t> <rid> <cmd> --json``
+    exec            -> ``lbg sdbx exec --user root --timeout <t> <rid> <cmd> --json``
     put_file        -> ``lbg sdbx files write --source <src> <rid> <path> --json``
     get_file        -> ``lbg sdbx files read <rid> <path> --format bytes --output <dst>``
     mount           -> in-sandbox download into ``ref.target_path()`` (proxy on ->
@@ -360,9 +360,21 @@ class LbgProvider(SandboxProvider):
         self._specs[spec.sandbox_id] = spec
         self._configure_pip_mirror(spec.sandbox_id)
         self._install_playground_cli(spec.sandbox_id)
+        self._ensure_standard_dirs(spec.sandbox_id)
         return SandboxHandle(
             sandbox_id=spec.sandbox_id, backend=self.name, workspace_path=_WORKSPACE,
         )
+
+    def _ensure_standard_dirs(self, sandbox_id: str) -> None:
+        """Create Harbor / zero path conventions that stock images often omit."""
+        try:
+            self.exec(
+                sandbox_id,
+                "mkdir -p /workspace /app/outputs && chmod 777 /workspace /app /app/outputs",
+                timeout=60,
+            )
+        except Exception:  # noqa: BLE001 - path bootstrap must never block create
+            pass
 
     def _configure_pip_mirror(self, sandbox_id: str) -> None:
         """Bake a domestic pip mirror into the fresh sandbox so every later
@@ -476,7 +488,9 @@ class LbgProvider(SandboxProvider):
     def exec(self, sandbox_id: str, command: str, timeout: int = 600,
              workdir: Optional[str] = None, env: Optional[dict[str, str]] = None) -> ExecResult:
         rid = self._rid(sandbox_id)
-        args = ["sdbx", "exec", "--timeout", str(timeout)]
+        # Default to root: Harbor tasks need /app and /workspace under /, which
+        # the non-root uid=1001 user cannot create on stock Bohrium images.
+        args = ["sdbx", "exec", "--user", "root", "--timeout", str(timeout)]
         if workdir:
             args += ["--cwd", workdir]
         merged_env: dict[str, str] = dict(env or {})

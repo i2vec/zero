@@ -40,44 +40,75 @@ def export_run(
     status: str,
     backend: str,
     conclusion: str = "",
+    resolved_task: str = "",
+    environment: Optional[dict] = None,
+    pull_deliverables: bool = True,
+    grading: Optional[dict] = None,
+    optimized_task: Optional[str] = None,
+    error: Optional[str] = None,
 ) -> Optional[Path]:
-    """Finalize ``runs/<task_id>/`` deliverables + metadata. Best-effort."""
+    """Finalize run metadata, optionally pulling Researcher deliverables."""
     try:
         cap = max(1, int(config.export_max_file_mb)) * 1024 * 1024
         run_dir = config.ensure_run_dirs(task_id)
         deliverables = run_dir / "deliverables"
 
-        got = _collect_export(manager, workspace, sandbox_ids, deliverables, cap)
+        got = (
+            _collect_export(manager, workspace, sandbox_ids, deliverables, cap)
+            if pull_deliverables
+            else "skipped"
+        )
 
         if conclusion.strip():
             (run_dir / "conclusion.md").write_text(conclusion, encoding="utf-8")
+        if resolved_task.strip():
+            (run_dir / "resolved_task.md").write_text(resolved_task, encoding="utf-8")
+        if environment is not None:
+            (run_dir / "environment.json").write_text(
+                json.dumps(environment, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
         trace_dir = run_dir / "trace"
+        payload = {
+            "task_id": task_id,
+            "status": status,
+            "backend": backend,
+            "sandbox_ids": sandbox_ids,
+            "prompt": prompt,
+            "created_at": time.time(),
+            "has_repo": (deliverables / "repo").is_dir(),
+            "has_output": (deliverables / "output").is_dir(),
+            "export_source": got,
+            "layout": "unified_run_folder",
+            "grading": grading or {},
+            "artifacts": {
+                "resolved_task": str(run_dir / "resolved_task.md") if resolved_task.strip() else None,
+                "environment": str(run_dir / "environment.json") if environment is not None else None,
+                "environment_md": (environment or {}).get("environment_md"),
+                "inventory": (environment or {}).get("inventory_path"),
+                "image_url": ((environment or {}).get("image") or {}).get("url"),
+                "grading": str(run_dir / "grading" / "result.json")
+                if (run_dir / "grading" / "result.json").is_file()
+                else None,
+                "optimized_task": optimized_task,
+            },
+            "paths": {
+                "workspace": str(run_dir / "workspace"),
+                "deliverables": str(deliverables),
+                "trace": str(trace_dir),
+                "teacher": str(run_dir / "teacher"),
+                "resources": str(run_dir / "resources"),
+                "logs": str(run_dir / "logs"),
+                "grading": str(run_dir / "grading"),
+                "environment": str(run_dir / "environment"),
+                "optimized_task": optimized_task,
+            },
+        }
+        if error:
+            payload["error"] = error[:2000]
         (run_dir / "run.json").write_text(
-            json.dumps(
-                {
-                    "task_id": task_id,
-                    "status": status,
-                    "backend": backend,
-                    "sandbox_ids": sandbox_ids,
-                    "prompt": prompt,
-                    "created_at": time.time(),
-                    "has_repo": (deliverables / "repo").is_dir(),
-                    "has_output": (deliverables / "output").is_dir(),
-                    "export_source": got,
-                    "layout": "unified_run_folder",
-                    "paths": {
-                        "workspace": str(run_dir / "workspace"),
-                        "deliverables": str(deliverables),
-                        "trace": str(trace_dir),
-                        "teacher": str(run_dir / "teacher"),
-                        "resources": str(run_dir / "resources"),
-                        "logs": str(run_dir / "logs"),
-                    },
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
         return run_dir

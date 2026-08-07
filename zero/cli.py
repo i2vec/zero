@@ -1,4 +1,4 @@
-"""``zero run <task.md|prompt>`` entrypoint."""
+"""``zero run <task-package-dir>`` entrypoint."""
 
 from __future__ import annotations
 
@@ -12,45 +12,26 @@ from pathlib import Path
 from zero.config import get_config
 from zero.orchestrator.orchestrator import Orchestrator
 
-_TASK_FILE_SUFFIXES = {".md", ".markdown", ".txt"}
-
-
-def _load_task_prompt(task: str) -> str:
-    """Resolve positional ``task`` to a prompt string.
-
-    If ``task`` is a path to an existing ``.md`` / ``.markdown`` / ``.txt`` file
-    (or ends with one of those suffixes), read the file. Otherwise treat it as
-    an inline natural-language prompt.
-    """
-    raw = (task or "").strip()
-    if not raw:
-        raise ValueError("task is empty")
-    path = Path(raw).expanduser()
-    looks_like_file = path.suffix.lower() in _TASK_FILE_SUFFIXES
-    if looks_like_file or path.is_file():
-        if not path.is_file():
-            raise ValueError(f"task file not found: {path}")
-        if path.suffix.lower() not in _TASK_FILE_SUFFIXES:
-            raise ValueError(
-                f"task file must be .md / .markdown / .txt, got {path.suffix!r}"
-            )
-        text = path.read_text(encoding="utf-8", errors="replace").strip()
-        if not text:
-            raise ValueError(f"task file is empty: {path}")
-        return text
-    return raw
-
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="zero", description="0号机: dual-agent scientific experiment system.")
+    parser = argparse.ArgumentParser(prog="zero", description="0号机: three-agent scientific experiment system.")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    run = sub.add_parser("run", help="Run a research task end to end.")
+    run = sub.add_parser(
+        "run",
+        help="Run a Harbor-style task package end to end.",
+        description=(
+            "Pass a task package directory containing instruction.md "
+            "(Researcher prompt) and preferably tests/ (grader). "
+            "Teacher can Read tests/ during completion review; paper/ is "
+            "auto-seeded as hints when present."
+        ),
+    )
     run.add_argument(
         "task",
-        help="Path to a task .md (recommended), or an inline natural-language prompt.",
+        help="Path to a task package directory (must contain instruction.md).",
     )
-    run.add_argument("--max-turns", type=int, default=60)
+    run.add_argument("--max-turns", type=int, default=1000)
     run.add_argument(
         "--run-name",
         default=None,
@@ -70,11 +51,16 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--hints",
         default=None,
-        help="Seed Teacher hint bank: path to a .md file or a directory of .md files, "
-             "copied into runs/<run>/teacher/hint_bank/ (does not overwrite existing files).",
+        help="Seed Teacher hint bank: path to a .md file or a directory of .md files. "
+             "If omitted, uses <package>/paper/paper.md or <package>/paper/*.md when present.",
     )
     run.add_argument("--no-teacher", action="store_true",
                      help="Disable the Teacher agent for this run (default ZERO_TEACHER_ENABLED).")
+    run.add_argument(
+        "--task-dir",
+        default=None,
+        help=argparse.SUPPRESS,  # deprecated alias; positional task is the package
+    )
 
     viewer = sub.add_parser("viewer", help="Serve the trace viewer over recorded traces (separate from runs).")
     viewer.add_argument("--host", default=None, help="Bind host (default ZERO_TRACE_UI_HOST).")
@@ -100,21 +86,40 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    from zero.grading.task_package import default_hints_path, resolve_task_package, tests_dir
+
     try:
-        prompt = _load_task_prompt(args.task)
+        # Deprecated --task-dir: if set, it is the package directory.
+        package_arg = getattr(args, "task_dir", None) or args.task
+        resolved = resolve_task_package(package_arg)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    task_path = Path(args.task).expanduser()
-    if task_path.is_file():
-        print(f"[run] task file: {task_path.resolve()}  ({len(prompt)} chars)")
+
+    prompt = resolved.prompt
+    task_package = resolved.package
+    print(f"[run] task package: {task_package}")
+    print(f"[run] instruction: {resolved.instruction_path}  ({len(prompt)} chars)")
+    tests = tests_dir(task_package)
+    if tests is not None:
+        print(f"[run] tests: {tests}")
+    else:
+        print("[run] tests: (none — grading/Teacher package review limited)")
+
+    hints = args.hints
+    if not hints:
+        auto = default_hints_path(task_package)
+        if auto is not None:
+            hints = str(auto)
+            print(f"[run] hints (auto): {auto}")
 
     orch = Orchestrator(manage_capgw=not args.no_capgw, serve_trace=args.trace_ui)
     try:
         result = await orch.run_task(
             prompt, max_turns=args.max_turns, run_name=args.run_name, export=not args.no_export,
             task_key=args.task_key, teacher_enabled=(False if args.no_teacher else None),
-            hints=args.hints,
+            hints=hints,
+            task_package=task_package,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -130,11 +135,17 @@ async def _run(args: argparse.Namespace) -> int:
     print(f"workspace: {result.workspace}")
     if result.export_dir:
         print(f"export  : {result.export_dir}  (deliverables/ + trace/ + teacher/)")
+    if result.grading:
+        print(f"grading : status={result.grading.get('status')} score={result.grading.get('score')}")
+    if result.optimized_task:
+        print(f"optimized_task: {result.optimized_task}")
+    if result.environment.get("environment_md"):
+        print(f"environment.md: {result.environment.get('environment_md')}")
     print(f"hook interceptions: {result.interceptions}")
     if result.teacher_stats:
         print(f"teacher : {json.dumps(result.teacher_stats, ensure_ascii=False)}")
     print("-" * 70)
-    print("最终结论:\n" + (result.conclusion or result.final_text or "(无)"))
+    print("最终结论:\n" + (result.conclusion or result.final_text or "(空)"))
     print("-" * 70)
     print("trace index:\n" + json.dumps(result.trace_index, ensure_ascii=False, indent=2))
 

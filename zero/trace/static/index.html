@@ -9,13 +9,26 @@
 <body data-view="rendered">
 <div class="topbar">
   <header>
+    <a class="back-link" href="/">← Runs</a>
     <h1>0号机 · Trace</h1>
     <span class="task" id="task">…</span>
     <span class="spacer"></span>
+    <button type="button" class="help-btn" data-help-open title="使用说明 (?)">使用说明</button>
+    <div class="role-filter" id="role-filter" aria-label="按角色筛选">
+      <button data-agent="all" class="active">全部</button>
+      <button data-agent="researcher">Researcher</button>
+      <button data-agent="labwright">Labwright</button>
+      <button data-agent="teacher">Teacher</button>
+    </div>
     <div class="seg" id="seg">
-      <button data-v="rendered">渲染</button>
-      <button data-v="raw">原始</button>
-      <button data-v="both">两者</button>
+      <button data-v="chain">链路</button>
+      <button data-v="rendered">完整</button>
+      <button data-v="raw">原始 JSON</button>
+    </div>
+    <div class="detail-actions" aria-label="详情展开控制">
+      <button id="expand-all" type="button">展开</button>
+      <button id="collapse-all" type="button">折叠</button>
+      <button id="jump-bottom" type="button" title="选中最新段并滚到底部">底部</button>
     </div>
     <span class="status" id="status"><span class="live-dot"></span>连接中</span>
   </header>
@@ -48,11 +61,13 @@
   <main class="detail-pane">
     <div class="pane-label">段详情</div>
     <div id="detail"><div class="empty">从左侧选择一段，或等待实时事件</div></div>
+    <button type="button" id="detail-bottom" class="jump-fab" title="滚到详情底部">↓ 底部</button>
   </main>
 </div>
 
 <script src="static/vendor/marked.min.js"></script>
 <script src="static/vendor/purify.min.js"></script>
-<script src="static/app.js"></script>
+<script src="static/help.js"></script>
+<script src="static/app.js?v=20260804-persist"></script>
 </body>
 </html>

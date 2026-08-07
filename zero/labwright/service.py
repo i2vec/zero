@@ -82,6 +82,9 @@ class LabwrightService:
         # spec_hash -> a completed READY response, for idempotent reuse across
         # retries / resume (never re-provision the same environment twice).
         self._ready: dict[str, EnvironmentResponse] = {}
+        # Sealed immediately before the Researcher starts. Later environment
+        # repair events must not replace the reusable, code/output-free image.
+        self._environment_baseline: Optional[EnvironmentManifest] = None
         # request_id -> the spec that request is provisioning (for continuation).
         self._specs: dict[str, EnvironmentSpec] = {}
         self._counter = itertools.count(1)
@@ -103,6 +106,7 @@ class LabwrightService:
         resp = await self._run_turn(request_id, self._prompt_ensure(spec, request_id), spec)
         if resp.status == EnvironmentStatus.ENVIRONMENT_READY:
             self._ready[h] = resp
+            self._seal_from_response(resp)
         return resp
 
     async def resolve_environment_decision(
@@ -144,6 +148,7 @@ class LabwrightService:
         )
         if resp.status == EnvironmentStatus.ENVIRONMENT_READY:
             self._ready[spec_hash(spec)] = resp
+            self._seal_from_response(resp)
         return resp
 
     async def add_resources(
@@ -163,27 +168,68 @@ class LabwrightService:
             "request_id": request_id, "sandbox_id": sandbox_id,
             "resources": [a.model_dump(exclude_none=True) for a in additions],
         })
+        # Dual-sandbox: never install onto the exp sandbox for a freeze.
+        existing = self._ctx.env_sandbox_id or sandbox_id
+        if self._mgr.role_of(sandbox_id) == "exp":
+            existing = None  # force a fresh env sandbox
         resp = await self._run_turn(
             request_id,
             self._prompt_add(merged, request_id, sandbox_id, additions),
             merged,
-            existing_sandbox_id=sandbox_id,
+            existing_sandbox_id=existing,
         )
-        if resp.status == EnvironmentStatus.ENVIRONMENT_READY:
-            # Normalize incremental success and update the sandbox bookkeeping.
-            resp = EnvironmentResponse(
-                status=EnvironmentStatus.RESOURCE_ADDED,
-                request_id=request_id, sandbox_id=sandbox_id,
-                manifest=resp.manifest,
-                message="资源已加入当前 Sandbox（Manifest 已更新）",
-            )
-            if resp.manifest:
-                self._ctx.sandbox_manifest[sandbox_id] = resp.manifest
-                self._ctx.sandbox_spec[sandbox_id] = merged
+        if resp.status in (EnvironmentStatus.ENVIRONMENT_READY, EnvironmentStatus.RESOURCE_ADDED):
+            if resp.manifest is not None:
+                self._ready[spec_hash(merged)] = EnvironmentResponse(
+                    status=EnvironmentStatus.ENVIRONMENT_READY,
+                    request_id=resp.request_id,
+                    sandbox_id=resp.sandbox_id,
+                    manifest=resp.manifest,
+                    message=resp.message,
+                    detail=resp.detail,
+                )
+                self._seal_from_response(resp)
         return resp
 
     def get_environment_manifest(self, sandbox_id: str) -> Optional[EnvironmentManifest]:
         return self._ctx.sandbox_manifest.get(sandbox_id)
+
+    def _seal_from_response(self, resp: EnvironmentResponse) -> None:
+        """Seal the clean env-side manifest on first READY."""
+        if self._environment_baseline is not None:
+            return
+        env_sid = None
+        if isinstance(resp.detail, dict):
+            env_sid = resp.detail.get("env_sandbox_id")
+        manifest = None
+        if env_sid:
+            manifest = self._ctx.sandbox_manifest.get(str(env_sid))
+        if manifest is None and self._ctx.env_sandbox_id:
+            manifest = self._ctx.sandbox_manifest.get(self._ctx.env_sandbox_id)
+        if manifest is None:
+            manifest = resp.manifest
+        if manifest is not None:
+            self._environment_baseline = manifest.model_copy(deep=True)
+
+    def seal_environment_baseline(self) -> Optional[EnvironmentManifest]:
+        """Freeze the newest READY env manifest before Researcher work begins."""
+        if self._environment_baseline is not None:
+            return self._environment_baseline
+        env_sid = self._ctx.env_sandbox_id
+        if env_sid:
+            manifest = self._ctx.sandbox_manifest.get(env_sid)
+            if manifest is not None:
+                self._environment_baseline = manifest.model_copy(deep=True)
+                return self._environment_baseline
+        sandbox_id = self._ctx.sandbox_id
+        manifest = self._ctx.sandbox_manifest.get(sandbox_id or "")
+        if manifest is None:
+            return None
+        self._environment_baseline = manifest.model_copy(deep=True)
+        return self._environment_baseline
+
+    def get_environment_baseline(self) -> Optional[EnvironmentManifest]:
+        return self._environment_baseline
 
     async def report_environment_issue(self, sandbox_id: str, issue: str) -> EnvironmentResponse:
         self._emit("labwright", "issue_reported", {
@@ -340,15 +386,18 @@ class LabwrightService:
         additions: list[ResourceAddition],
     ) -> str:
         return (
-            f"Incremental resource request request_id={request_id} "
-            f"into existing sandbox_id={sandbox_id}.\n"
+            f"Incremental resource request request_id={request_id}.\n"
+            f"Researcher currently uses sandbox_id={sandbox_id} "
+            f"(likely an **exp** sandbox).\n"
+            f"Dual-sandbox: create a **new env** sandbox "
+            f"(create_sandbox; prefer base_image from the last frozen image), "
+            f"install the additions there, verify, then publish_manifest with "
+            f"as_resource_added=true so a **new clean exp** is spawned. "
+            f"Return that new exp sandbox_id to the Researcher.\n"
             f"Additions:\n"
             f"```json\n{json.dumps([a.model_dump(exclude_none=True) for a in additions], ensure_ascii=False, indent=2)}\n```\n"
             f"Merged full Spec (for reference):\n"
             f"```json\n{json.dumps(spec.model_dump(exclude_none=True), ensure_ascii=False, indent=2)}\n```\n"
-            f"Do NOT create_sandbox again; use sandbox_exec / collect_resource / "
-            f"mount_resource / verify_resource, then publish_manifest "
-            f"(you may set as_resource_added=true)."
         )
 
     def _prompt_issue(

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "zero"
 version = "0.1.0"
-description = "0号机: a dual-agent (Researcher + Labwright) scientific experiment execution system"
+description = "0号机: a three-agent (Researcher + Labwright + Teacher) scientific experiment execution system"
 requires-python = ">=3.10"
 dependencies = [
     "claude-agent-sdk>=0.2.0",

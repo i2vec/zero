@@ -53,6 +53,8 @@ class SandboxSpec:
     memory_gb: int = 8
     gpu_count: int = 0
     python_version: str = "3.11"
+    # Dual-sandbox: env = provision/freeze only; exp = Researcher experiments.
+    role: str = "env"  # env | exp
 
 
 @dataclass
@@ -61,6 +63,10 @@ class SandboxHandle:
     backend: str
     workspace_path: str               # path the Researcher/experiment sees
     resource_paths: dict[str, str] = field(default_factory=dict)  # uri -> in-sandbox path
+    role: str = "env"
+    parent_sandbox_id: Optional[str] = None
+    environment_id: Optional[str] = None
+    spawn_mode: Optional[str] = None  # from_image | reinstall_from_freeze | venv_clone
 
 
 @dataclass

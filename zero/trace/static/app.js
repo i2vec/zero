@@ -2,7 +2,8 @@
  *
  * SSE events:
  *   { t:"orch",  agent, event, detail, ts }
- *   { t:"model", agent, ts, index, input, output }
+ *   { t:"model", agent, ts, index, input, turn_input, output }  // compact deltas
+ *   (legacy) also accepts full input.messages without turn_input
  *
  * Left spine = handoff/work/lifecycle segments; right = selected segment detail.
  */
@@ -42,6 +43,12 @@ const followBtn = document.getElementById("follow");
 const rc = document.getElementById("rc");
 const lc = document.getElementById("lc");
 const tc = document.getElementById("tc");
+const roleFilterEl = document.getElementById("role-filter");
+const expandAllBtn = document.getElementById("expand-all");
+const collapseAllBtn = document.getElementById("collapse-all");
+const jumpBottomBtn = document.getElementById("jump-bottom");
+const detailBottomBtn = document.getElementById("detail-bottom");
+let activeAgentFilter = localStorage.getItem("zeroTraceAgentFilter") || "all";
 
 function setStatus(text, kind) {
   statusEl.className = "status" + (kind ? " " + kind : "");
@@ -58,14 +65,103 @@ function updateIdleHeaders() {
 }
 
 (function initViewToggle() {
-  const saved = localStorage.getItem("zeroView") || "rendered";
+  // New key intentionally resets the old rendered/raw/compact preference:
+  // chain is the default information architecture for the redesigned viewer.
+  const saved = localStorage.getItem("zeroTraceViewV2") || "chain";
   document.body.dataset.view = saved;
   document.querySelectorAll("#seg button").forEach((b) => {
     if (b.dataset.v === saved) b.classList.add("active");
     b.onclick = () => {
       document.body.dataset.view = b.dataset.v;
-      localStorage.setItem("zeroView", b.dataset.v);
+      localStorage.setItem("zeroTraceViewV2", b.dataset.v);
       document.querySelectorAll("#seg button").forEach((x) => x.classList.toggle("active", x === b));
+      // Compact changes which parts of a card are visible and opens the
+      // conversation body, so rebuild the selected detail immediately.
+      lastDetailSig = "";
+      renderDetail();
+      lastDetailSig = detailSig(segments.find((s) => s.id === selectedId));
+    };
+  });
+})();
+
+function setAllDetails(open) {
+  detailEl.querySelectorAll("details").forEach((det) => {
+    det.open = open;
+  });
+  if (open) {
+    detailEl.querySelectorAll("details").forEach((det) => {
+      const key = det.dataset.openKey;
+      if (key) {
+        openKeys.add(key);
+        closedKeys.delete(key);
+      }
+    });
+  } else {
+    detailEl.querySelectorAll("details").forEach((det) => {
+      const key = det.dataset.openKey;
+      if (key) {
+        openKeys.delete(key);
+        closedKeys.add(key);
+      }
+    });
+  }
+  persistUi();
+}
+
+expandAllBtn.onclick = () => setAllDetails(true);
+collapseAllBtn.onclick = () => setAllDetails(false);
+
+function scrollDetailBottom() {
+  detailEl.scrollTop = detailEl.scrollHeight;
+}
+
+function jumpToBottom() {
+  const visible = visibleSegments();
+  stickLatest = true;
+  followBtn.style.display = "none";
+  if (visible.length) {
+    selectedId = visible[visible.length - 1].id;
+    lastDetailSig = "";
+    renderSpine();
+    renderDetail();
+    lastDetailSig = detailSig(segments.find((s) => s.id === selectedId));
+    persistUi();
+  }
+  spineEl.scrollTop = spineEl.scrollHeight;
+  // Detail content may reflow after render; scroll again on next frames.
+  scrollDetailBottom();
+  requestAnimationFrame(() => {
+    scrollDetailBottom();
+    setTimeout(scrollDetailBottom, 50);
+  });
+}
+
+jumpBottomBtn.onclick = jumpToBottom;
+detailBottomBtn.onclick = () => {
+  scrollDetailBottom();
+  requestAnimationFrame(scrollDetailBottom);
+};
+
+(function initRoleFilter() {
+  function update() {
+    roleFilterEl.querySelectorAll("button").forEach((b) => {
+      b.classList.toggle("active", b.dataset.agent === activeAgentFilter);
+    });
+  }
+  update();
+  roleFilterEl.querySelectorAll("button").forEach((b) => {
+    b.onclick = () => {
+      activeAgentFilter = b.dataset.agent;
+      localStorage.setItem("zeroTraceAgentFilter", activeAgentFilter);
+      stickLatest = false;
+      const visible = visibleSegments();
+      if (!visible.some((s) => s.id === selectedId)) selectedId = visible[0]?.id || null;
+      followBtn.style.display = "block";
+      lastDetailSig = "";
+      update();
+      renderSpine();
+      renderDetail();
+      persistUi();
     };
   });
 })();
@@ -74,6 +170,7 @@ function updateIdleHeaders() {
 const LIFECYCLE = new Set([
   "task_received", "researcher_started", "task_completed", "task_failed",
   "hook_intercept", "run_exported", "teacher_stats",
+  "teacher_preflight_started", "teacher_preflight_finished", "teacher_preflight_failed",
   "external_deliverable_validation_failed",
 ]);
 const ENTER = new Set([
@@ -93,7 +190,17 @@ const STATUS_LABEL = {
   collect_ambiguous: "资源候选歧义", resource_collected: "资源已搜集",
   resource_mounted: "资源已挂载", skill_candidate_proposed: "Skill 候选",
   hint_bank_read: "已读 hint bank", hint_given: "给出 HINT",
+  hint_bank_seeded: "Hint bank 已种入",
   task_amended: "订正题面", declined: "拒答 NO_HELP",
+  grader_amended: "订正 grader", both_amended: "题面+grader 同改",
+  package_applied: "Live 题包已更新", package_apply_rejected: "题包订正被拒（lint）",
+  preflight_started: "Preflight 开始", preflight_finished: "Preflight 结束",
+  preflight_error: "Preflight 出错",
+  completion_review_started: "结题审阅开始",
+  completion_review_finished: "结题审阅结束",
+  completion_review_error: "结题审阅出错",
+  completion_apply: "结题订正已写入 live 包",
+  review_no_change: "结题：题包无需改动",
   task_addendum_written: "题面订正已落盘", agent_error: "Agent 错误",
   external_task_preparation_started: "外部任务准备中",
   external_task_prepared: "外部任务已准备",
@@ -123,6 +230,7 @@ function outcomeOfReturn(ev) {
   if (event === "answered") {
     const k = (d.kind || "ANSWER").toUpperCase();
     if (k === "HINT" || k === "TASK_AMENDMENT") return { label: k, tone: "ok" };
+    if (k === "GRADER_AMENDMENT" || k === "BOTH_AMENDMENT") return { label: k, tone: "ok" };
     if (k === "NO_HELP") return { label: k, tone: "decision" };
     return { label: k, tone: "neutral" };
   }
@@ -141,11 +249,18 @@ function lifecycleLabel(ev) {
   const d = ev.detail || {};
   if (ev.event === "task_completed") return "任务完成";
   if (ev.event === "task_failed") return "任务失败";
-  if (ev.event === "hook_intercept") return "拦截: " + ((d.command || "").slice(0, 48));
+  if (ev.event === "hook_intercept") return "拦截: " + (d.command || "");
   if (ev.event === "researcher_started") return "Researcher 开始";
   if (ev.event === "task_received") return "收到任务";
   if (ev.event === "run_exported") return "已导出";
   if (ev.event === "teacher_stats") return "Teacher 统计";
+  if (ev.event === "teacher_preflight_started") return "Teacher Preflight 开始";
+  if (ev.event === "teacher_preflight_finished") {
+    const rev = d.revision != null ? ` · r${String(d.revision).padStart(3, "0")}` : "";
+    const ok = d.ok === false ? "（未完全通过）" : "";
+    return "Teacher Preflight 结束" + rev + ok;
+  }
+  if (ev.event === "teacher_preflight_failed") return "Teacher Preflight 失败";
   return ev.event;
 }
 
@@ -154,6 +269,48 @@ let segments = [];
 let openHandoff = null;
 let openWork = null;
 let nextId = 1;
+let previousMessagesByAgent = {};
+
+function sameMessage(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function withoutInjectedContext(message) {
+  if (!message || message.role !== "user") return message;
+  const blocks = (message.blocks || []).filter((block) => {
+    const text = String(block.text || "").trim();
+    // Claude Code injects these as ordinary user text in some SDK paths
+    // (not always in a <system-reminder> wrapper). They describe the harness,
+    // not the task input the agent is responding to.
+    const injected = [
+      "<system-reminder>",
+      "Available agent types for the Agent tool:",
+      "The following skills are available for use with the Skill tool:",
+      "As you answer the user's questions, you can use the following context:",
+      "IMPORTANT: this context may or may not be relevant to your task.",
+    ];
+    return !injected.some((prefix) => text.startsWith(prefix));
+  });
+  return Object.assign({}, message, { blocks });
+}
+
+function incrementalInput(agent, messages) {
+  const previous = previousMessagesByAgent[agent] || [];
+  let common = 0;
+  while (common < previous.length && common < messages.length &&
+         sameMessage(previous[common], messages[common])) {
+    common += 1;
+  }
+  previousMessagesByAgent[agent] = messages;
+
+  // A request repeats the whole conversation. Only appended user/tool-result
+  // messages are the actual new input for this model turn; prior assistant
+  // messages are rendered as the preceding turn's output.
+  let delta = messages.slice(common).filter((message) => message.role !== "assistant");
+  if (!previous.length) delta = delta.map(withoutInjectedContext)
+    .filter((message) => (message.blocks || []).length);
+  return delta;
+}
 
 function newSeg(partial) {
   const s = Object.assign({
@@ -170,6 +327,9 @@ function newSeg(partial) {
     outcome: null,       // {label, tone}
     pending: false,
     lifecycle: null,
+    participants: [],
+    fromAgent: null,
+    toAgent: null,
   }, partial);
   segments.push(s);
   return s;
@@ -186,17 +346,34 @@ function closeHandoff(pending) {
   openHandoff = null;
 }
 
+function absorbIntoRecentHandoff(agent, ts) {
+  // Live SSE can deliver agent_turn_end slightly ahead of the callee's last
+  // capgw model line. Fold that trailing call back into the handoff instead of
+  // inventing a dangling "Labwright · 1 次调用" work segment.
+  const prev = segments.length ? segments[segments.length - 1] : null;
+  if (!prev || prev.kind !== "handoff" || prev.agent !== agent) return null;
+  // Model may have an earlier wall-clock ts than the already-applied turn_end.
+  if (ts != null && prev.tsStart != null && ts + 1 < prev.tsStart) return null;
+  if (ts != null && prev.tsEnd != null && ts - prev.tsEnd > 30) return null;
+  return prev;
+}
+
 function ensureWork(agent, ts) {
   // Callee models stay inside the open handoff; anyone else ends it.
   if (openHandoff) {
     if (openHandoff.agent === agent) return openHandoff;
     closeHandoff(false);
   }
+  const absorbed = absorbIntoRecentHandoff(agent, ts);
+  if (absorbed) return absorbed;
   if (openWork && openWork.agent === agent) return openWork;
   closeWork();
   openWork = newSeg({
     kind: "work",
     agent,
+    participants: [agent],
+    fromAgent: agent,
+    toAgent: agent,
     title: AGENT_LABEL[agent] || agent,
     tsStart: ts,
     tsEnd: ts,
@@ -238,6 +415,9 @@ function pushOrch(ev) {
     openHandoff = newSeg({
       kind: "handoff",
       agent,
+      participants: ["researcher", agent],
+      fromAgent: "researcher",
+      toAgent: agent,
       title: from + " → " + to + " · " + enterVerb(event),
       tsStart: ev.ts, tsEnd: ev.ts,
       enter: ev,
@@ -277,6 +457,9 @@ function pushOrch(ev) {
         newSeg({
           kind: "handoff",
           agent,
+          participants: [agent, "researcher"],
+          fromAgent: agent,
+          toAgent: "researcher",
           title: (AGENT_LABEL[agent] || agent) + " → Researcher · " + out.label,
           tsStart: ev.ts, tsEnd: ev.ts,
           returns: [ev],
@@ -303,6 +486,21 @@ function pushModel(ev) {
   else rc.textContent = ++RES;
   updateIdleHeaders();
 
+  // Prefer server-computed delta; fall back to client diff for legacy streams.
+  if (Array.isArray(ev.turn_input)) {
+    ev.turnInput = ev.turn_input;
+    if (ev.input && Array.isArray(ev.input.messages)) {
+      previousMessagesByAgent[agent] = ev.input.messages;
+    }
+  } else {
+    ev.turnInput = incrementalInput(agent, (ev.input && ev.input.messages) || []);
+  }
+  // Full-view input panel shows this turn's delta (history is in earlier turns).
+  if (ev.input && !Array.isArray(ev.input.messages)) {
+    ev.input = Object.assign({}, ev.input, { messages: ev.turnInput || [] });
+  } else if (!ev.input) {
+    ev.input = { num_messages: 0, num_tools: 0, messages: ev.turnInput || [] };
+  }
   const seg = ensureWork(agent, ev.ts);
   seg.models.push(ev);
   bumpSegTime(seg, ev.ts);
@@ -317,15 +515,28 @@ function pushEvent(ev) {
 let selectedId = null;
 let stickLatest = true;
 let lastDetailSig = "";
-/** Keys of <details> the user opened — survive live re-renders. */
+/** Keys of <details> the user opened — survive live re-renders + refresh. */
 const openKeys = new Set();
+/** Explicitly closed keys — distinguish "default open" from "user collapsed". */
+const closedKeys = new Set();
+/** Per-segment model window {from,to}, keyed by segKey — survives refresh. */
+const modelWindows = new Map();
 
-function bindOpen(det, key) {
+function bindOpen(det, key, opts) {
   if (!key) return det;
-  if (openKeys.has(key)) det.open = true;
+  const defaultOpen = !!(opts && opts.defaultOpen);
+  det.dataset.openKey = key;
+  if (closedKeys.has(key)) det.open = false;
+  else if (openKeys.has(key)) det.open = true;
+  else det.open = defaultOpen;
   det.addEventListener("toggle", () => {
-    if (det.open) openKeys.add(key);
-    else openKeys.delete(key);
+    if (det.open) {
+      openKeys.add(key);
+      closedKeys.delete(key);
+    } else {
+      openKeys.delete(key);
+      closedKeys.add(key);
+    }
     persistUi();
   });
   return det;
@@ -338,28 +549,61 @@ function segKey(seg) {
 function persistUi() {
   if (!curTask) return;
   try {
-    sessionStorage.setItem("zeroTrace:" + curTask, JSON.stringify({
+    // Snapshot model windows from live segments.
+    segments.forEach((s) => {
+      if (s._modelWindow) modelWindows.set(segKey(s), { ...s._modelWindow });
+    });
+    const payload = {
       stickLatest,
       segKey: (() => {
         const s = segments.find((x) => x.id === selectedId);
         return s ? segKey(s) : null;
       })(),
       openKeys: Array.from(openKeys),
-    }));
+      closedKeys: Array.from(closedKeys),
+      modelWindows: Array.from(modelWindows.entries()),
+      view: document.body.dataset.view || "chain",
+    };
+    sessionStorage.setItem("zeroTrace:" + curTask, JSON.stringify(payload));
+    // Mirror to localStorage so a hard refresh / new tab still remembers.
+    localStorage.setItem("zeroTrace:" + curTask, JSON.stringify(payload));
   } catch (e) { /* quota / private mode */ }
 }
 
 function restoreUi() {
   if (!curTask) return;
   try {
-    const raw = sessionStorage.getItem("zeroTrace:" + curTask);
+    const raw = sessionStorage.getItem("zeroTrace:" + curTask)
+      || localStorage.getItem("zeroTrace:" + curTask);
     if (!raw) return;
     const st = JSON.parse(raw);
     if (typeof st.stickLatest === "boolean") stickLatest = st.stickLatest;
-    if (Array.isArray(st.openKeys)) st.openKeys.forEach((k) => openKeys.add(k));
+    if (Array.isArray(st.openKeys)) {
+      openKeys.clear();
+      st.openKeys.forEach((k) => openKeys.add(k));
+    }
+    if (Array.isArray(st.closedKeys)) {
+      closedKeys.clear();
+      st.closedKeys.forEach((k) => closedKeys.add(k));
+    }
+    if (Array.isArray(st.modelWindows)) {
+      modelWindows.clear();
+      st.modelWindows.forEach((pair) => {
+        if (Array.isArray(pair) && pair.length === 2 && pair[1]) {
+          modelWindows.set(pair[0], pair[1]);
+        }
+      });
+    }
+    if (st.view && !localStorage.getItem("zeroTraceViewV2")) {
+      // Prefer explicit view toggle storage; only fall back here.
+    }
     if (st.segKey) {
       const hit = segments.find((s) => segKey(s) === st.segKey);
-      if (hit) selectedId = hit.id;
+      if (hit) {
+        selectedId = hit.id;
+        const win = modelWindows.get(st.segKey);
+        if (win) hit._modelWindow = { ...win };
+      }
     }
   } catch (e) { /* ignore */ }
   followBtn.style.display = stickLatest ? "none" : "block";
@@ -380,14 +624,34 @@ function detailSig(seg) {
   ].join(":");
 }
 
+function segmentMatchesFilter(seg) {
+  if (activeAgentFilter === "all") return true;
+  if (seg.kind === "lifecycle") return false;
+  // This is intentionally strict: "Researcher" means only the Researcher's
+  // own model/work trace, not every handoff it initiated to another role.
+  return seg.agent === activeAgentFilter;
+}
+
+function visibleSegments() {
+  return segments.filter(segmentMatchesFilter);
+}
+
 function renderSpine() {
   const prevScroll = spineEl.scrollTop;
   spineEl.innerHTML = "";
+  const visible = visibleSegments();
+  if (!visible.length) {
+    const label = activeAgentFilter === "all"
+      ? "等待事件…"
+      : `暂无 ${AGENT_LABEL[activeAgentFilter]} 记录`;
+    spineEl.appendChild(el("div", "empty sm", label));
+    return;
+  }
   if (!segments.length) {
     spineEl.appendChild(el("div", "empty sm", "等待事件…"));
     return;
   }
-  segments.forEach((seg) => {
+  visible.forEach((seg) => {
     const btn = el("button",
       "spine-item kind-" + seg.kind + " agent-" + seg.agent + (seg.id === selectedId ? " active" : ""));
     btn.type = "button";
@@ -432,6 +696,129 @@ function inputBlock(bk) {
   if (t === "text" || t === "thinking") b.appendChild(mdEl(bk.text));
   else b.appendChild(pre(bk.text || ""));
   return b;
+}
+
+function parseToolInput(call) {
+  let input = call.input;
+  if (typeof input === "string") {
+    try { input = JSON.parse(input); } catch (e) { /* preserve plain input */ }
+  }
+  return input;
+}
+
+function toolTarget(input) {
+  if (!input || typeof input !== "object") return "";
+  return String(
+    input.file_path || input.path || input.command || input.question ||
+    input.sandbox_id || input.uri || input.url || input.pattern || ""
+  );
+}
+
+function toolBody(input) {
+  if (!input || typeof input !== "object") {
+    return typeof input === "string" ? input : "";
+  }
+  if (typeof input.content === "string") return input.content;
+  if (typeof input.new_string === "string") {
+    const parts = [];
+    if (input.old_string) parts.push("<<< old >>>\n" + input.old_string);
+    parts.push("<<< new >>>\n" + input.new_string);
+    return parts.join("\n\n");
+  }
+  if (typeof input.command === "string") return input.command;
+  if (typeof input.prompt === "string") return input.prompt;
+  return "";
+}
+
+function renderChainAction(call) {
+  const wrap = el("div", "chain-action");
+  const input = parseToolInput(call);
+  const name = call.name || "tool";
+  const target = toolTarget(input);
+  const body = toolBody(input);
+
+  const head = el("div", "chain-action-head", target ? `${name} · ${target}` : name);
+  wrap.appendChild(head);
+
+  if (body && body !== target) {
+    wrap.appendChild(pre(body));
+  } else if (input && typeof input === "object") {
+    const rest = Object.assign({}, input);
+    delete rest.file_path;
+    delete rest.path;
+    delete rest.content;
+    delete rest.old_string;
+    delete rest.new_string;
+    delete rest.command;
+    if (Object.keys(rest).length) wrap.appendChild(pre(jsonStr(rest)));
+  } else if (typeof input === "string" && input && input !== target) {
+    wrap.appendChild(pre(input));
+  }
+  return wrap;
+}
+
+function renderChainInput(message) {
+  const wrap = el("div", "chain-input");
+  const role = message.role === "user" ? "输入" : (message.role || "消息");
+  wrap.appendChild(el("div", "chain-label", role));
+  const blocks = message.blocks || [];
+  if (!blocks.length) {
+    wrap.appendChild(el("div", "muted", "（无可展示的新增输入）"));
+    return wrap;
+  }
+  blocks.forEach((block) => {
+    if (block.type === "thinking") return;
+    if (block.type === "text") {
+      wrap.appendChild(mdEl(block.text));
+    } else if (block.type === "tool_result") {
+      const result = el("div", "chain-tool-result");
+      result.appendChild(el("div", "chain-label", block.is_error ? "工具结果 · error" : "工具结果"));
+      result.appendChild(pre(block.text, block.is_error ? "err" : ""));
+      wrap.appendChild(result);
+    } else {
+      wrap.appendChild(pre(block.text));
+    }
+  });
+  return wrap;
+}
+
+function renderChainTurn(ev) {
+  const out = ev.output || {};
+  const agent = ev.agent || "researcher";
+  const card = el("article", "chain-turn agent-" + agent);
+  const head = el("div", "chain-head");
+  head.appendChild(el("span", "agent-pill " + agent, AGENT_LABEL[agent] || agent));
+  head.appendChild(el("span", "chip", fmtTime(ev.ts)));
+  head.appendChild(el("span", "tag", "第 " + ((ev.index || 0) + 1) + " 轮"));
+  const tools = out.tool_calls || [];
+  if (out.error) head.appendChild(el("span", "badge err ml-auto", "错误"));
+  else if (tools.length) {
+    head.appendChild(el("span", "badge ok-soft ml-auto",
+      tools.map((t) => t.name || "tool").slice(0, 2).join(", ")));
+  }
+  card.appendChild(head);
+
+  const inputs = ev.turnInput || [];
+  const inputSec = el("section", "chain-section");
+  inputSec.appendChild(el("div", "chain-section-title", "输入"));
+  if (inputs.length) inputs.forEach((message) => inputSec.appendChild(renderChainInput(message)));
+  else inputSec.appendChild(el("div", "muted", "继续上一轮任务（没有新的用户/工具输入）"));
+  card.appendChild(inputSec);
+
+  const outputSec = el("section", "chain-section");
+  outputSec.appendChild(el("div", "chain-section-title", "回答"));
+  if (out.error) outputSec.appendChild(pre(jsonStr(out.error), "err"));
+  else if (out.text) outputSec.appendChild(mdEl(out.text));
+  else outputSec.appendChild(el("div", "muted", "（本轮没有回答正文）"));
+  card.appendChild(outputSec);
+
+  if (tools.length) {
+    const actionSec = el("section", "chain-section");
+    actionSec.appendChild(el("div", "chain-section-title", "动作"));
+    tools.forEach((call) => actionSec.appendChild(renderChainAction(call)));
+    card.appendChild(actionSec);
+  }
+  return card;
 }
 
 function renderModelCard(ev) {
@@ -480,16 +867,23 @@ function renderModelCard(ev) {
 
   const raw = el("div", "out-raw");
   raw.appendChild(el("div", "sec-label", "输出 · 原始 JSON"));
-  const data = out.error ? out.error : out.raw;
-  raw.appendChild(pre(data != null ? jsonStr(data) : "(无原始数据)", out.error ? "err" : ""));
+  // Lean SSE drops duplicate ``raw``; fall back to structured output fields.
+  const data = out.error ? out.error : (out.raw != null ? out.raw : {
+    reasoning: out.reasoning, text: out.text, tool_calls: out.tool_calls,
+    stop_reason: out.stop_reason,
+  });
+  raw.appendChild(pre(jsonStr(data), out.error ? "err" : ""));
   body.appendChild(raw);
 
   const inpDet = document.createElement("details");
   inpDet.className = "input";
   const inpSum = document.createElement("summary");
-  inpSum.textContent = "输入 · " + (inp.num_messages || 0) + " 消息 · " + (inp.num_tools || 0) + " 工具";
+  const deltaMsgs = inp.messages || ev.turnInput || [];
+  inpSum.textContent = "本轮输入 · " + deltaMsgs.length + " 条"
+    + (inp.num_messages ? "（请求共 " + inp.num_messages + " 消息）" : "")
+    + (inp.num_tools ? " · " + inp.num_tools + " 工具" : "");
   inpDet.appendChild(inpSum);
-  (inp.messages || []).forEach((m) => {
+  deltaMsgs.forEach((m) => {
     const mb = el("div", "msg");
     mb.appendChild(el("div", "blk-tag", "▸ " + (m.role || "")));
     (m.blocks || []).forEach((bk) => mb.appendChild(inputBlock(bk)));
@@ -529,7 +923,60 @@ function renderStatusChip(ev, idx) {
   return card;
 }
 
+function compactEventDetail(ev) {
+  const d = ev?.detail || {};
+  for (const key of [
+    "package_delta", "researcher_delta", "question", "message", "reason",
+    "scientific_impact", "summary",
+  ]) {
+    if (typeof d[key] === "string" && d[key].trim()) return d[key].trim();
+  }
+  if (d.revision != null && (ev.event || "").includes("package")) {
+    return `package r${String(d.revision).padStart(3, "0")}`;
+  }
+  return "";
+}
+
+function clearMoreObservers() {
+  (_moreObservers || []).forEach((obs) => obs.disconnect());
+  _moreObservers = [];
+}
+
+function moreButton(label, hint) {
+  const btn = el("button", "more-btn");
+  btn.type = "button";
+  btn.appendChild(el("span", null, label));
+  if (hint) btn.appendChild(el("span", "more-hint", hint));
+  return btn;
+}
+
+function unwatchMore(el) {
+  if (!el || !el._moreObs) return;
+  el._moreObs.disconnect();
+  el._moreObs = null;
+}
+
+/** Auto-expand when the sentinel approaches the detail viewport. */
+function watchNear(el, onNear) {
+  if (!el || typeof IntersectionObserver !== "function") return;
+  unwatchMore(el);
+  const obs = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      unwatchMore(el);
+      onNear();
+      break;
+    }
+  }, { root: detailEl, rootMargin: "320px 0px", threshold: 0 });
+  el._moreObs = obs;
+  obs.observe(el);
+  _moreObservers.push(obs);
+}
+
+let _moreObservers = [];
+
 function renderDetail() {
+  clearMoreObservers();
   detailEl.innerHTML = "";
   const seg = segments.find((s) => s.id === selectedId);
   if (!seg) {
@@ -562,6 +1009,7 @@ function renderDetail() {
 
   if (seg.kind === "handoff") {
     const d = (seg.enter && seg.enter.detail) || {};
+    const ret = (seg.returns && seg.returns[seg.returns.length - 1] && seg.returns[seg.returns.length - 1].detail) || {};
     const extra = d.request_id || d.ask_id || d.sandbox_id || "";
     if (extra) {
       const line = el("div", "detail-meta");
@@ -569,6 +1017,39 @@ function renderDetail() {
       line.appendChild(el("span", null, "id · "));
       line.appendChild(el("b", null, extra));
       head.appendChild(line);
+    }
+    const rev = ret.package_revision != null ? ret.package_revision : d.package_revision;
+    const delta = ret.package_delta || d.package_delta || "";
+    if (rev != null || delta) {
+      const pkgLine = el("div", "detail-meta");
+      pkgLine.style.marginTop = "6px";
+      if (rev != null) {
+        pkgLine.appendChild(el("span", null, "package · "));
+        pkgLine.appendChild(el("b", null, "r" + String(rev).padStart(3, "0")));
+      }
+      if (delta) {
+        if (rev != null) pkgLine.appendChild(el("span", null, " · "));
+        pkgLine.appendChild(el("span", "flow-copy", String(delta).slice(0, 240)));
+      }
+      head.appendChild(pkgLine);
+    }
+    const from = seg.fromAgent || (seg.participants || []).find((a) => a !== seg.agent) || "researcher";
+    const to = seg.toAgent || seg.agent;
+    const flow = el("div", "handoff-flow");
+    flow.appendChild(el("span", "agent-pill " + from, AGENT_LABEL[from] || from));
+    flow.appendChild(el("span", "flow-arrow", "→"));
+    flow.appendChild(el("span", "agent-pill " + to, AGENT_LABEL[to] || to));
+    flow.appendChild(el("span", "flow-copy",
+      compactEventDetail(seg.enter) || "等待对方处理并返回结果"));
+    head.appendChild(flow);
+    if (seg.outcome) {
+      const returned = el("div", "handoff-return");
+      returned.appendChild(el("span", "flow-arrow", "↳ 返回"));
+      returned.appendChild(el("span", "badge " + seg.outcome.tone, seg.outcome.label));
+      const lastReturn = seg.returns[seg.returns.length - 1];
+      const returnCopy = compactEventDetail(lastReturn);
+      if (returnCopy) returned.appendChild(el("span", "flow-copy", returnCopy));
+      head.appendChild(returned);
     }
   }
   if (seg.kind === "lifecycle" && seg.lifecycle) {
@@ -583,7 +1064,7 @@ function renderDetail() {
       sum.style.color = "var(--muted)";
       det.appendChild(sum);
       det.appendChild(pre(jsonStr(d)));
-      head.appendChild(det);
+      head.appendChild(bindOpen(det, "life:" + segKey(seg)));
     }
   }
   detailEl.appendChild(head);
@@ -591,6 +1072,29 @@ function renderDetail() {
   if (seg.kind === "lifecycle" && !seg.models.length && !seg.statuses.length) {
     detailEl.appendChild(el("div", "muted", "生命周期事件，无模型调用。"));
     return;
+  }
+
+  let detailTarget = detailEl;
+  let execution = null;
+  if (seg.kind === "handoff" && (seg.statuses.length || seg.models.length)) {
+    execution = document.createElement("details");
+    execution.className = "execution-details";
+    const summary = document.createElement("summary");
+    summary.textContent = `执行细节 · ${seg.statuses.length} 个状态 · ${seg.models.length} 次模型调用`;
+    execution.appendChild(summary);
+    const execKey = "exec:" + segKey(seg);
+    // Chain view defaults open; user's prior collapse/expand survives refresh.
+    bindOpen(execution, execKey, {
+      defaultOpen: document.body.dataset.view === "chain",
+    });
+    detailTarget = el("div", "execution-body");
+    execution.appendChild(detailTarget);
+  }
+
+  // Restore model pagination window before painting cards.
+  if (!seg._modelWindow) {
+    const savedWin = modelWindows.get(segKey(seg));
+    if (savedWin) seg._modelWindow = { ...savedWin };
   }
 
   if (seg.statuses.length) {
@@ -604,26 +1108,101 @@ function renderDetail() {
       for (let i = from; i < end; i++) wrap.appendChild(renderStatusChip(seg.statuses[i], i));
       shown = end;
       const old = sec.querySelector(".more-btn");
-      if (old) old.remove();
+      if (old) {
+        unwatchMore(old);
+        old.remove();
+      }
       if (shown < seg.statuses.length) {
-        const btn = el("button", "more-btn", "还有 " + (seg.statuses.length - shown) + " 条…");
-        btn.type = "button";
-        btn.onclick = () => renderMore(shown);
+        const btn = moreButton(
+          "还有 " + (seg.statuses.length - shown) + " 条状态",
+          "滚到此处自动加载 · 也可点击",
+        );
+        const loadMore = () => renderMore(shown);
+        btn.onclick = loadMore;
         sec.appendChild(btn);
+        watchNear(btn, loadMore);
       }
     };
     sec.appendChild(wrap);
     renderMore(0);
-    detailEl.appendChild(sec);
+    detailTarget.appendChild(sec);
   }
 
   if (seg.models.length) {
     const sec = el("div", "section");
-    sec.appendChild(el("div", "section-h", "模型调用 · " + seg.models.length));
-    seg.models.forEach((m) => sec.appendChild(renderModelCard(m)));
-    detailEl.appendChild(sec);
+    const chain = document.body.dataset.view === "chain";
+    sec.appendChild(el("div", "section-h",
+      (chain ? "执行链路 · " : "模型调用 · ") + seg.models.length + (chain ? " 轮" : "")));
+    if (chain) sec.classList.add("chain-list");
+    const LIMIT = 8;
+    let from;
+    let to;
+    if (seg._modelWindow && !stickLatest) {
+      // Keep the user's page across live re-renders.
+      from = Math.max(0, seg._modelWindow.from || 0);
+      to = Math.min(seg.models.length, Math.max(from, seg._modelWindow.to || from));
+      if (to <= from) to = Math.min(seg.models.length, from + LIMIT);
+    } else if (stickLatest && seg.models.length > LIMIT) {
+      // Live follow: paint the newest page first (data is already in memory).
+      from = seg.models.length - LIMIT;
+      to = seg.models.length;
+    } else {
+      from = 0;
+      to = Math.min(seg.models.length, LIMIT);
+    }
+    const wrap = el("div", null);
+    const paint = (anchor) => {
+      wrap.querySelectorAll(".more-btn").forEach(unwatchMore);
+      seg._modelWindow = { from, to };
+      const prevScroll = detailEl.scrollTop;
+      const prevHeight = detailEl.scrollHeight;
+      wrap.innerHTML = "";
+      if (from > 0) {
+        const earlier = moreButton(
+          "↑ 更早的 " + from + " 轮",
+          "滚到此处自动加载 · 也可点击",
+        );
+        const loadEarlier = () => {
+          stickLatest = false;
+          followBtn.style.display = "block";
+          from = Math.max(0, from - LIMIT);
+          paint("earlier");
+        };
+        earlier.onclick = loadEarlier;
+        wrap.appendChild(earlier);
+        watchNear(earlier, loadEarlier);
+      }
+      seg.models.slice(from, to).forEach((m) => {
+        wrap.appendChild(chain ? renderChainTurn(m) : renderModelCard(m));
+      });
+      if (to < seg.models.length) {
+        const later = moreButton(
+          "↓ 还有更新的 " + (seg.models.length - to) + " 轮",
+          "滚到此处自动加载 · 也可点击",
+        );
+        const loadLater = () => {
+          stickLatest = false;
+          followBtn.style.display = "block";
+          to = Math.min(seg.models.length, to + LIMIT);
+          paint("later");
+        };
+        later.onclick = loadLater;
+        wrap.appendChild(later);
+        watchNear(later, loadLater);
+      }
+      if (anchor === "earlier") {
+        // Keep viewport stable when prepending older turns.
+        detailEl.scrollTop = prevScroll + (detailEl.scrollHeight - prevHeight);
+      }
+    };
+    sec.appendChild(wrap);
+    paint();
+    detailTarget.appendChild(sec);
   } else if (seg.kind === "handoff" && seg.pending) {
-    detailEl.appendChild(el("div", "muted", "交接进行中，等待被叫方模型调用与终态…"));
+    detailTarget.appendChild(el("div", "muted", "交接进行中，等待被叫方模型调用与终态…"));
+  }
+  if (execution) {
+    detailEl.appendChild(execution);
   }
 }
 
@@ -639,8 +1218,9 @@ function selectSegment(id) {
 let _raf = 0;
 let _restoredOnce = false;
 function afterPush() {
-  if (stickLatest && segments.length) {
-    selectedId = segments[segments.length - 1].id;
+  const visible = visibleSegments();
+  if (stickLatest && visible.length) {
+    selectedId = visible[visible.length - 1].id;
     followBtn.style.display = "none";
   }
   // Debounce DOM work — SSE replay can deliver hundreds of events quickly.
@@ -668,14 +1248,7 @@ function afterPush() {
 }
 
 followBtn.onclick = () => {
-  stickLatest = true;
-  followBtn.style.display = "none";
-  if (segments.length) selectedId = segments[segments.length - 1].id;
-  lastDetailSig = "";
-  renderSpine();
-  renderDetail();
-  lastDetailSig = detailSig(segments.find((s) => s.id === selectedId));
-  persistUi();
+  jumpToBottom();
 };
 
 // ---------- stream ----------
@@ -687,6 +1260,7 @@ function resetState() {
   openHandoff = null;
   openWork = null;
   nextId = 1;
+  previousMessagesByAgent = {};
   selectedId = null;
   stickLatest = true;
   lastDetailSig = "";
@@ -708,12 +1282,19 @@ function addCard(ev) {
 
 function connect(taskId) {
   if (es) es.close();
-  const taskChanged = curTask !== taskId;
+  const prevTask = curTask;
+  const taskChanged = prevTask != null && prevTask !== taskId;
   curTask = taskId;
   sawAny = false;
   resetState();
-  if (taskChanged) openKeys.clear();
-  else restoreUi(); // same task reconnect: preload prefs before events arrive
+  if (taskChanged) {
+    openKeys.clear();
+    closedKeys.clear();
+    modelWindows.clear();
+  }
+  // Always preload prefs for this task before the SSE replay (full refresh
+  // used to skip this because curTask started as null → "taskChanged").
+  restoreUi();
   taskEl.textContent = taskId;
   setStatus("实时");
   es = new EventSource("stream/" + encodeURIComponent(taskId));
@@ -731,5 +1312,9 @@ async function poll() {
 }
 
 const requestedTask = new URLSearchParams(window.location.search).get("task_id");
-if (requestedTask) connect(requestedTask);
-else { poll(); setInterval(poll, 4000); }
+if (requestedTask) {
+  connect(requestedTask);
+} else {
+  // Detail page requires an explicit task — list lives at /.
+  window.location.replace("/");
+}

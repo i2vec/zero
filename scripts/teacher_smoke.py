@@ -87,7 +87,10 @@ async def test_hintbank_tools(root: Path) -> None:
 
     ctx.set_ask(TeacherAsk(ask_id="ask-2", question="q2"))
     await _call_tool(server, "amend_task_statement", {
-        "patch": "Output units are kJ/mol, not eV.", "reason": "unit omitted", "section": "Output",
+        "patch": "Output units are kJ/mol, not eV.",
+        "reason": "unit omitted",
+        "section": "Output",
+        "literature_basis": "Paper reports energies in kJ/mol.",
     })
     if ctx.answer is None or ctx.answer.kind is not TeachingKind.TASK_AMENDMENT:
         _fail("amend_task_statement should set a TASK_AMENDMENT answer")
@@ -127,7 +130,9 @@ class _StubAgent:
         elif action == "amend":
             await _call_tool(self._server, "amend_task_statement", {
                 "patch": "The reference tolerance is +/-5%, not +/-1%.",
-                "reason": "original tolerance was a typo", "section": "Scoring",
+                "reason": "original tolerance was a typo",
+                "section": "Scoring",
+                "literature_basis": "Paper Table 2 lists +/-5%.",
             })
         elif action == "decline":
             await _call_tool(self._server, "decline", {"reason": "no matching hint"})

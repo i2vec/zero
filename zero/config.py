@@ -86,13 +86,22 @@ class Config:
     lbg_bin: str = field(default_factory=lambda: os.environ.get("ZERO_LBG_BIN", "lbg"))
     bohr_bin: str = field(default_factory=lambda: os.environ.get("ZERO_BOHR_BIN", "/root/.bohrium/bohr"))
     # Auto-destroy lifetime (seconds) for each created sandbox; bounds cost if a
-    # run is abandoned. ``lbg``'s own default is 12h (43200); we default lower.
-    lbg_sandbox_timeout: int = field(default_factory=lambda: int(os.environ.get("ZERO_LBG_TIMEOUT", "10800")))
+    # run is abandoned. Align with ``lbg``'s own default (12h) so long CPU/GPU
+    # training (e.g. Deep BSDE) is not paused mid-run under the old 3h default.
+    lbg_sandbox_timeout: int = field(default_factory=lambda: int(os.environ.get("ZERO_LBG_TIMEOUT", "43200")))
     # Extra overlay disk on top of the fixed 30Gi default, set at template time.
     lbg_extra_disk_gb: int = field(default_factory=lambda: int(os.environ.get("ZERO_LBG_EXTRA_DISK_GB", "0")))
     # Optional project id: when set, sandboxes bill to that project's budget
     # instead of the personal wallet (passed as ``--project-id``).
     lbg_project_id: str = field(default_factory=lambda: os.environ.get("ZERO_LBG_PROJECT_ID", ""))
+    # Completion waits for an LBG image commit so environment.json can record
+    # its real imageUrl. Set 0 to only persist the async commit id.
+    lbg_image_wait_timeout: int = field(default_factory=lambda: int(
+        os.environ.get("ZERO_LBG_IMAGE_WAIT_TIMEOUT", "1800")))
+    # How long publish_manifest may block waiting for imageUrl before spawning
+    # the experiment sandbox. On timeout, exp is spawned via freeze reinstall.
+    lbg_spawn_wait_timeout: int = field(default_factory=lambda: int(
+        os.environ.get("ZERO_LBG_SPAWN_WAIT_TIMEOUT", "300")))
     # Domestic pip mirror baked into every lbg sandbox at creation, so installs
     # don't stall on the (often unreachable) default pypi.org. Empty = leave the
     # image's own pip config untouched.
@@ -109,6 +118,12 @@ class Config:
     # Ask budget for one run, so the Researcher cannot outsource its thinking.
     teacher_max_asks: int = field(default_factory=lambda: int(
         os.environ.get("ZERO_TEACHER_MAX_ASKS", "8")))
+    # Max live package revisions (preflight + mid-run + completion) per run.
+    package_max_revisions: int = field(default_factory=lambda: int(
+        os.environ.get("ZERO_PACKAGE_MAX_REVISIONS", "12")))
+    # Teacher preflight of the task package before Researcher starts.
+    teacher_preflight: bool = field(default_factory=lambda: os.environ.get(
+        "ZERO_TEACHER_PREFLIGHT", "1").strip().lower() not in ("0", "false", "no", ""))
 
     # Live trace viewer (three-column web dashboard) settings.
     trace_ui_port: int = field(default_factory=lambda: int(os.environ.get("ZERO_TRACE_UI_PORT", "8901")))
@@ -180,6 +195,8 @@ class Config:
             "logs",
             "meta",
             "meta/skill_candidates",
+            "grading",
+            "environment",
         ):
             (rd / sub).mkdir(parents=True, exist_ok=True)
         manifest = rd / "resources" / "manifest.json"

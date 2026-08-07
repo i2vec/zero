@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -30,6 +30,29 @@ from claude_agent_sdk import (
 
 from zero.config import Config
 
+# Full Claude Code host-side tool set granted to every agent. Role separation
+# is advisory (system prompts + MCP contracts), not a permission boundary.
+HOST_TOOLS = [
+    "Agent",
+    "AskUserQuestion",
+    "Bash",
+    "Edit",
+    "EnterPlanMode",
+    "EnterWorktree",
+    "ExitPlanMode",
+    "ExitWorktree",
+    "Glob",
+    "Grep",
+    "TodoWrite",
+    "Read",
+    "Skill",
+    "TaskStop",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+    "NotebookEdit",
+]
+
 
 async def allow_all(tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext) -> PermissionResultAllow:
     """Programmatic permission handler.
@@ -41,6 +64,20 @@ async def allow_all(tool_name: str, tool_input: dict[str, Any], context: ToolPer
     """
     return PermissionResultAllow()
 
+
+async def prompt_stream(prompt: str, *, session_id: str = "default") -> AsyncIterator[dict[str, Any]]:
+    """Wrap a one-shot string prompt as an AsyncIterable for streaming mode.
+
+    ``can_use_tool`` requires streaming mode in the Agent SDK; a bare string
+    prompt raises ``ValueError``. One yielded user message matches the SDK's
+    documented streaming shape and ends the input stream afterward.
+    """
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+        "parent_tool_use_id": None,
+        "session_id": session_id,
+    }
 
 def build_env(config: Config, session_key: str) -> dict[str, str]:
     """Environment for a spawned Claude Code process pointed at capgw."""
@@ -150,7 +187,9 @@ async def run_agent(
         if on_event:
             on_event(ev)
 
-    async for message in query(prompt=prompt, options=options):
+    # can_use_tool requires AsyncIterable prompt (streaming mode).
+    stream = prompt if options.can_use_tool is None else prompt_stream(prompt)
+    async for message in query(prompt=stream, options=options):
         consume_message(message, result, emit)
     return result
 

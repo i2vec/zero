@@ -11,16 +11,21 @@ from typing import Callable, Optional
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-from zero.claude_runtime import RunResult, TurnEvent, build_env, consume_message, skill_plugins
+from zero.claude_runtime import (
+    HOST_TOOLS,
+    RunResult,
+    TurnEvent,
+    allow_all,
+    build_env,
+    consume_message,
+    skill_plugins,
+)
 from zero.config import Config
 from zero.labwright.prompts import LABWRIGHT_SYSTEM
 from zero.labwright.tools import LabwrightContext, build_labenv_server
 
 _ALLOWED_TOOLS = [
-    # Read-only file access: environment debugging genuinely needs to read
-    # manifests / lockfiles / logs, and it lets reference-based skills work.
-    # Write/Edit stay off — authoring experiment code is the Researcher's job.
-    "Read", "Glob", "Grep",
+    *HOST_TOOLS,
     "mcp__labenv__create_sandbox",
     "mcp__labenv__sandbox_exec",
     "mcp__labenv__collect_resource",
@@ -43,7 +48,7 @@ class LabwrightAgent:
         task_id: str,
         ctx: LabwrightContext,
         on_event: Optional[Callable[[TurnEvent], None]] = None,
-        max_turns: int = 40,
+        max_turns: int = 1000,
         cwd: Optional[str] = None,
     ):
         self._config = config
@@ -59,12 +64,13 @@ class LabwrightAgent:
         session_key = f"{self._task_id}/trace/labwright"
         plugins = skill_plugins(self._config.labwright_skills_dir)
         return ClaudeAgentOptions(
+            tools={"type": "preset", "preset": "claude_code"},
             system_prompt=LABWRIGHT_SYSTEM,
             allowed_tools=_ALLOWED_TOOLS,
-            disallowed_tools=["Bash", "WebFetch", "WebSearch", "NotebookEdit",
-                              "Write", "Edit"],
+            disallowed_tools=[],
             mcp_servers={"labenv": build_labenv_server(self._ctx)},
             permission_mode="acceptEdits",
+            can_use_tool=allow_all,
             cwd=self._cwd,
             env=build_env(self._config, session_key),
             model=self._config.model,
