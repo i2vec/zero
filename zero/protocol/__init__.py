@@ -15,6 +15,10 @@ from zero.protocol.spec import (
     ResourceAddition,
     ToolRequest,
 )
+from zero.protocol.resources import (
+    ArtifactRef, RegistryCandidate, ResourceKind, ResourceLock,
+    ResourceLockEntry, VerificationEvidence,
+)
 from zero.protocol.manifest import (
     DatasetEntry,
     EnvironmentManifest,
@@ -41,6 +45,12 @@ __all__ = [
     "PackageRequest",
     "ResourceAddition",
     "ToolRequest",
+    "ArtifactRef",
+    "RegistryCandidate",
+    "ResourceKind",
+    "ResourceLock",
+    "ResourceLockEntry",
+    "VerificationEvidence",
     "DatasetEntry",
     "EnvironmentManifest",
     "ModelEntry",

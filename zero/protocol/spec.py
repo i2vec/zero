@@ -24,6 +24,11 @@ class PackageRequest(BaseModel):
 class ToolRequest(BaseModel):
     name: str
     version: Optional[str] = None
+    capabilities: list[str] = Field(default_factory=list)
+    license: Optional[str] = None
+    platform: Optional[str] = None
+    resource_unique_key: Optional[str] = None
+    allow_compatible: bool = False
 
 
 class ModelRequest(BaseModel):
@@ -33,6 +38,11 @@ class ModelRequest(BaseModel):
     # Optional explicit source to disambiguate (e.g. hf repo id). When absent
     # and resolution is ambiguous, Labwright escalates NEEDS_DECISION.
     source: Optional[str] = None
+    capabilities: list[str] = Field(default_factory=list)
+    license: Optional[str] = None
+    platform: Optional[str] = None
+    resource_unique_key: Optional[str] = None
+    allow_compatible: bool = False
 
 
 class DatasetRequest(BaseModel):
@@ -40,6 +50,11 @@ class DatasetRequest(BaseModel):
     version: Optional[str] = None
     access: Literal["read_only", "read_write"] = "read_only"
     source: Optional[str] = None
+    capabilities: list[str] = Field(default_factory=list)
+    license: Optional[str] = None
+    platform: Optional[str] = None
+    resource_unique_key: Optional[str] = None
+    allow_compatible: bool = False
 
 
 class ComputeSpec(BaseModel):

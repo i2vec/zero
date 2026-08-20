@@ -55,3 +55,4 @@ class EnvironmentInventory(BaseModel):
     image: ImageRecord = Field(default_factory=ImageRecord)
     files: dict[str, str] = Field(default_factory=dict)          # relative paths of side files
     notes: list[str] = Field(default_factory=list)
+    resources_lock_digest: Optional[str] = None

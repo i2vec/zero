@@ -314,8 +314,18 @@ class Orchestrator:
                 status = "task_failed" if result.is_error else "task_completed"
                 if result.is_error and result.final_text:
                     fail_error = result.final_text[:1000]
-                self._db.update(task_id, task_status=status, result=result.final_text)
-                trace.emit("orchestrator", status, {"num_turns": result.num_turns, "interceptions": interceptions["n"]})
+                # A successful Researcher turn is only provisional: grading,
+                # Teacher finalization and (on LBG) image materialization still
+                # have to finish before this run may be called completed.
+                provisional_status = "task_failed" if result.is_error else "finalizing"
+                self._db.update(
+                    task_id, task_status=provisional_status, result=result.final_text,
+                )
+                trace.emit(
+                    "orchestrator",
+                    "researcher_failed" if result.is_error else "researcher_completed",
+                    {"num_turns": result.num_turns, "interceptions": interceptions["n"]},
+                )
 
                 trace_index = correlate_traces(task_id, self._config, sandbox_ids)
 
@@ -376,6 +386,48 @@ class Orchestrator:
                     labwright, manager, sandbox_ids, run_dir=run_dir,
                 )
 
+                # Teacher freezes the task package before the asynchronous LBG
+                # commit has resolved. Bind the final immutable image back into
+                # both compatibility copies once the real image URL is known.
+                # An optimized LBG task is not complete without this binding.
+                if optimized_task and manager.backend == "lbg":
+                    image = environment.get("image") or {}
+                    image_url = str(image.get("url") or "").strip()
+                    if image.get("status") != "ready" or not image_url:
+                        status = "task_failed"
+                        fail_error = (
+                            "optimized task image was not materialized: "
+                            f"status={image.get('status') or 'unknown'}; "
+                            f"commit_id={image.get('commit_id') or 'unknown'}; "
+                            f"error={image.get('error') or 'none'}"
+                        )[:1000]
+                        trace.emit("orchestrator", "optimized_task_image_failed", {
+                            "status": image.get("status"),
+                            "commit_id": image.get("commit_id"),
+                            "error": image.get("error"),
+                        })
+                    else:
+                        try:
+                            updated = self._bind_image_to_optimized_tasks(
+                                run_dir, image_url,
+                            )
+                            trace.emit("orchestrator", "optimized_task_image_bound", {
+                                "image_url": image_url,
+                                "updated": updated,
+                            })
+                        except Exception as exc:  # noqa: BLE001
+                            status = "task_failed"
+                            fail_error = f"failed to bind optimized task image: {exc}"[:1000]
+                            trace.emit("orchestrator", "optimized_task_image_failed", {
+                                "status": "write_failed",
+                                "image_url": image_url,
+                                "error": str(exc)[:500],
+                            })
+
+                if fail_error and status == "task_failed" and not result.is_error:
+                    suffix = f"\n\nZero finalization failed: {fail_error}"
+                    result.final_text = (result.final_text or "") + suffix
+
                 export_dir = ""
                 path = export_run(
                     self._config, manager,
@@ -418,6 +470,15 @@ class Orchestrator:
                             trace.emit("orchestrator", "external_deliverable_validation_failed", {
                                 "error": result.final_text[:500],
                             })
+
+                # Emit the terminal state only after every completion contract
+                # (including the optimized-task image binding) has settled.
+                self._db.update(task_id, task_status=status, result=result.final_text)
+                trace.emit("orchestrator", status, {
+                    "num_turns": result.num_turns,
+                    "interceptions": interceptions["n"],
+                    "finalized": True,
+                })
 
                 return TaskResult(
                     task_id=task_id,
@@ -671,6 +732,77 @@ class Orchestrator:
             "manifest": manifest.model_dump(mode="json"),
             "image": image,
         }
+
+    @staticmethod
+    def _bind_image_to_optimized_tasks(run_dir: Path, image_url: str) -> list[str]:
+        """Atomically bind a ready image into finalized/optimized task copies.
+
+        Both files are runtime entry points used by downstream consumers, so a
+        partial or ambiguous rewrite is rejected instead of silently leaving a
+        public base image behind. All replacements are validated before any
+        target file is changed.
+        """
+        image_url = image_url.strip()
+        if not image_url or any(ch.isspace() for ch in image_url):
+            raise ValueError(f"invalid image URL: {image_url!r}")
+
+        replacements: list[tuple[Path, str]] = []
+        package_dirs = [
+            run_dir / name
+            for name in ("finalized_task", "optimized_task")
+            if (run_dir / name).is_dir()
+        ]
+        if not package_dirs:
+            raise FileNotFoundError("no finalized_task or optimized_task directory")
+
+        for package_dir in package_dirs:
+            task_toml = package_dir / "task.toml"
+            dockerfile = package_dir / "environment" / "Dockerfile"
+            if not task_toml.is_file() or not dockerfile.is_file():
+                raise FileNotFoundError(
+                    f"{package_dir} must contain task.toml and environment/Dockerfile"
+                )
+
+            toml_text = task_toml.read_text(encoding="utf-8")
+            toml_updated, toml_count = re.subn(
+                r'(?m)^(docker_image\s*=\s*)"[^"]*"\s*$',
+                lambda match: f'{match.group(1)}"{image_url}"',
+                toml_text,
+            )
+            if toml_count != 1:
+                raise ValueError(
+                    f"expected exactly one docker_image in {task_toml}; found {toml_count}"
+                )
+
+            docker_text = dockerfile.read_text(encoding="utf-8")
+            docker_updated, docker_count = re.subn(
+                r"(?m)^FROM\s+\S+\s*$",
+                f"FROM {image_url}",
+                docker_text,
+                count=1,
+            )
+            if docker_count != 1:
+                raise ValueError(f"expected a FROM line in {dockerfile}")
+            replacements.extend([
+                (task_toml, toml_updated),
+                (dockerfile, docker_updated),
+            ])
+
+        temporary: list[tuple[Path, Path]] = []
+        try:
+            for target, content in replacements:
+                tmp = target.with_name(f".{target.name}.image.tmp")
+                tmp.write_text(content, encoding="utf-8")
+                temporary.append((tmp, target))
+            for tmp, target in temporary:
+                tmp.replace(target)
+        finally:
+            for tmp, _ in temporary:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return [str(path) for path, _ in replacements]
 
     def _labwright_emit(self, trace: TraceWriter):
         def emit(agent: str, event: str, detail: dict) -> None:

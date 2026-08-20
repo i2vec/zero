@@ -189,7 +189,17 @@ Researcher / Labwright 已加载 `sandbox-root` / `lbg-cli` Skills，默认以 r
 
 ### 使用 Bohrium 云 sandbox（`lbg`）
 
-前提：宿主机装好 `lbg` 与 `bohr` CLI，并提供 Bohrium access key。key 的解析顺序：
+前提：宿主机装好 `lbg`、`bohr` 与 `trisol` CLI，并提供 Bohrium access key。
+Trisol 是 Playground 数据/模型资产传输的系统依赖，不属于 Python `pyproject.toml`：
+
+```bash
+curl -fsSL https://trisol.dp.tech/install.sh | bash
+trisol version
+TRISOL_TOKEN=... trisol whoami
+```
+
+Zero 也会在每个新 LBG sandbox 内安装并验证 Trisol；安装或版本检查失败时，
+sandbox 创建失败并自动销毁，不会以“资产可用”的状态继续运行。key 的解析顺序：
 
 1. 环境变量 `BOHRIUM_ACCESS_KEY` / `ACCESS_KEY` / `BOHRIUM_KEY`
 2. dotenv 文件里的 `bohrium_key=...`（默认包目录 `.env`，用 `ZERO_BOHRIUM_ENV` 覆盖）
@@ -211,6 +221,11 @@ lbg 后端会自动：`bohr image list` 挑基础镜像 → 选满足 cpu/内存
 | `ZERO_PIP_INDEX_URL` | 清华源 | 创建时写入 sandbox 的 pip 镜像（置空则不改） |
 | `ZERO_LBG_BIN` | `lbg` | lbg 可执行路径 |
 | `ZERO_BOHR_BIN` | `/root/.bohrium/bohr` | bohr 可执行路径 |
+| `ZERO_TRISOL_INSTALL_URL` | `https://trisol.dp.tech/install.sh` | LBG sandbox 内安装 Trisol 的 HTTPS 脚本 |
+| `TRISOL_TOKEN` | 空 | Trisol 非交互认证 token；仅注入 sandbox 子进程，不写入任务产物 |
+| `TRISOL_TEAM` | 空 | Trisol 资产团队 ID 或名称；等价于全局 `--team`，不是 Bohrium project id |
+| `LITERATURE_SAGE_PROXY_URL` | 空 | Literature Sage 专用 HTTP CONNECT 代理；不影响 Trisol/S3 传输 |
+| `DEPLOY_MASTER_BASE_URL` | 空 | Tool 未命中时使用的 Deploy Master API；为空会显式禁用构建 |
 
 ---
 
@@ -288,6 +303,8 @@ runs/<run名>/
 │   ├── completion_review.json
 │   └── hint_bank/        # 本次 Teacher 专用 hint；Researcher 看不到
 ├── resources/            # 本 run 资源下载/缓存
+├── resources.lock.json   # 实际使用的跨题资源、不可变制品引用与验证证据
+├── assets.json           # 统一交付索引：题目镜像、工具镜像、数据/模型 Trisol ID 与版本
 ├── sandboxes/            # local 后端 venv（若用）
 ├── logs/                 # 含 capgw.log
 └── meta/
@@ -312,8 +329,27 @@ runs/<run名>/
 |------|------|
 | `resolved_task.md` | 原始题面 + 本次全部 `TASK_AMENDMENT` |
 | `environment.json` | 已验证环境的 manifest，以及镜像提交状态 / `imageUrl` |
+| `assets.json` | 单点读取题目镜像 URI、工具 OCI URI/digest、数据/模型 Trisol ID/team/version/splits |
 
 Snapshot 在 Labwright **`publish_manifest` 时**创建（交给 Researcher 使用该环境之前），不以实验输出为镜像内容。
+
+### 跨题资源目录：Library First
+
+Labwright 对每个 tool/model/dataset 先调用 Literature Sage 的 Search + Detail
+查询。目录命中只代表“发现候选”，不代表资源可用：tool 仍须在本题环境验证；
+model/dataset 优先把 `trisol_id` 解析为带 team/version/splits 的固定 URI，下载真实字节、
+计算完整 SHA-256、只读挂载并
+执行加载/读取检查。未命中的 tool 可交给 Deploy Master 构建 OCI 镜像；目录写入只保存
+元数据和稳定制品引用。新数据/模型先上传 Trisol，再把返回 ID 写入 Literature Sage；
+新工具由 Deploy Master 推送 OCI Registry，再把镜像 URI/digest 写入 Literature Sage。
+
+通过验证后，Labwright 写 `resources.lock.json`；其中每个必需资源都包含来源、制品
+URI/digest 和验证证据。`publish_manifest` 会拒绝缺 lock 或验证失败的必需资源，并把
+lock digest 同时写入 Manifest 和 environment inventory。正式发布可设置
+`ZERO_RESOURCE_RELEASE_STRICT=1`，要求制品引用带不可变 digest。
+
+相关配置见 `.env.example`。Registry 不可用时会留下显式降级记录；写入超时会先按
+unique key 查询确认结果，不会盲目重试或覆盖已有资源。
 
 `environment.json` 的 `snapshot_scope`：
 

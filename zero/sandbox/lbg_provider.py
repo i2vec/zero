@@ -68,7 +68,7 @@ import tempfile
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from zero.config import Config
 from zero.sandbox.base import (
@@ -226,8 +226,12 @@ class LbgProvider(SandboxProvider):
         return _as_list(_loads(self._text(proc)))
 
     def _pick_base_image(self, spec: SandboxSpec) -> str:
-        # An explicit registry path (e.g. "registry.dp.tech/...:tag") wins.
-        if spec.base_image and "/" in spec.base_image:
+        # An explicit image reference wins: a full registry path
+        # (e.g. "registry.dp.tech/...:tag") or an immutable commit ref
+        # ("lbg:commit:<id>", which lbg itself resolves for committed images).
+        if spec.base_image and (
+            "/" in spec.base_image or spec.base_image.startswith("lbg:commit:")
+        ):
             return spec.base_image
 
         images = self._list_base_images()
@@ -358,9 +362,16 @@ class LbgProvider(SandboxProvider):
         rid = self._create_with_retry(template)
         self._remote[spec.sandbox_id] = str(rid)
         self._specs[spec.sandbox_id] = spec
-        self._configure_pip_mirror(spec.sandbox_id)
-        self._install_playground_cli(spec.sandbox_id)
-        self._ensure_standard_dirs(spec.sandbox_id)
+        try:
+            self._configure_pip_mirror(spec.sandbox_id)
+            self._install_trisol_cli(spec.sandbox_id)
+            self._install_playground_cli(spec.sandbox_id)
+            self._ensure_standard_dirs(spec.sandbox_id)
+        except Exception:
+            # Dependency bootstrap is part of sandbox readiness. Do not leave
+            # a billed sandbox behind when a required CLI cannot be installed.
+            self.destroy(spec.sandbox_id)
+            raise
         return SandboxHandle(
             sandbox_id=spec.sandbox_id, backend=self.name, workspace_path=_WORKSPACE,
         )
@@ -396,11 +407,37 @@ class LbgProvider(SandboxProvider):
         except Exception:  # noqa: BLE001 - mirror setup must never break create
             pass
 
+    def _install_trisol_cli(self, sandbox_id: str) -> None:
+        """Install and verify the Trisol system CLI inside an LBG sandbox."""
+        install_url = (self._cfg.trisol_install_url or "").strip()
+        if not install_url.startswith("https://"):
+            raise RuntimeError(
+                f"ZERO_TRISOL_INSTALL_URL must be an https URL, got {install_url!r}"
+            )
+        install = self.exec(
+            sandbox_id,
+            "command -v trisol >/dev/null 2>&1 || "
+            f"(curl -fsSL {shlex.quote(install_url)} | bash)",
+            timeout=300,
+        )
+        if not install.ok:
+            raise RuntimeError(
+                f"Trisol installation failed in {sandbox_id}: "
+                f"{(install.stderr or install.stdout)[-500:]}"
+            )
+        verify = self.exec(sandbox_id, "trisol version", timeout=60)
+        if not verify.ok or "trisol" not in (verify.stdout or "").lower():
+            raise RuntimeError(
+                f"Trisol verification failed in {sandbox_id}: "
+                f"{(verify.stderr or verify.stdout)[-500:]}"
+            )
+
     def _install_playground_cli(self, sandbox_id: str) -> None:
         """Install playground CLI inside the sandbox so the Researcher can use
         ``playground task download`` / ``playground data pull`` directly.
 
-        Installs Node.js and Trisol rootless (no apt/sudo needed), then playground via npm.
+        Trisol is installed and verified separately as a required dependency;
+        this method installs Node.js and the Playground wrapper.
         Best-effort: silently skipped on any failure.
         """
         try:
@@ -415,14 +452,8 @@ class LbgProvider(SandboxProvider):
         except Exception:  # noqa: BLE001
             return
         try:
-            # 2. Trisol is the data helper used by Playground task/data downloads.
-            self.exec(
-                sandbox_id,
-                "command -v trisol >/dev/null 2>&1 || "
-                "(curl -fsSL https://trisol.dp.tech/install.sh | bash)",
-                timeout=300,
-            )
-            # 3. playground CLI via npm
+            # Playground delegates its asset transfer to the verified Trisol
+            # binary installed during sandbox bootstrap.
             self.exec(
                 sandbox_id,
                 "/home/user/.local/bin/npm install -g "
@@ -502,7 +533,9 @@ class LbgProvider(SandboxProvider):
         )
         if playground_token:
             merged_env.setdefault("PLAYGROUND_TOKEN", playground_token)
-        for key in ("PLAYGROUND_API_BASE",):
+        for key in (
+            "PLAYGROUND_API_BASE", "TRISOL_TOKEN", "TRISOL_API_URL", "TRISOL_TEAM",
+        ):
             val = os.environ.get(key, "").strip()
             if val:
                 merged_env.setdefault(key, val)
@@ -576,6 +609,35 @@ class LbgProvider(SandboxProvider):
         rid = self._rid(sandbox_id)  # noqa: F841 - validates the sandbox exists
         ref = mount.ref
         target = ref.target_path()
+        if ref.source and ref.source.startswith("trisol://"):
+            parsed = urlsplit(ref.source)
+            parts = parsed.path.strip("/").split("/")
+            query = parse_qs(parsed.query)
+            asset_id = parts[0]
+            version = parts[1] if len(parts) > 1 else ref.version
+            team = (query.get("team") or [""])[0]
+            team_flag = f" -t {shlex.quote(team)}" if team else ""
+            prefix = f"trisol --no-input --no-color{team_flag}"
+            if ref.kind == "dataset":
+                splits = query.get("split", [])
+                if not splits:
+                    raise RuntimeError(f"Trisol dataset URI has no splits: {ref.source}")
+                commands = [
+                    f"{prefix} dataset download {shlex.quote(asset_id)} {shlex.quote(version)} "
+                    f"{shlex.quote(split)} --output {shlex.quote(target + '/')}"
+                    for split in splits
+                ]
+                dl = " && ".join(commands)
+            else:
+                name = (query.get("name") or [asset_id])[0]
+                dl = (f"{prefix} model download {shlex.quote(name + ':' + version)} "
+                      f"--output {shlex.quote(target + '/')}")
+            self.exec(sandbox_id, f"mkdir -p {shlex.quote(target)}", timeout=60)
+            result = self.exec(sandbox_id, dl, timeout=7200)
+            if not result.ok:
+                raise RuntimeError(f"lbg Trisol mount failed for {ref.uri()}: {result.stderr[:400]}")
+            return target
+
         rev = ref.version if ref.version and ref.version.lower() != "latest" else ""
         rev_flag = f" --revision {shlex.quote(rev)}" if rev else ""
         if ref.kind == "dataset":
@@ -610,7 +672,16 @@ class LbgProvider(SandboxProvider):
         rid = self._rid(sandbox_id)
         project_id = self._cfg.lbg_project_id
         if project_id:
-            name = f"zero-{sandbox_id}-{int(time.time())}"
+            # LBG image names accept lowercase letters, digits and hyphens
+            # only.  Logical Zero sandbox ids contain uppercase workflow
+            # names and underscores (for example ``WF-7__...``), so passing
+            # them through verbatim makes every commit fail validation and
+            # silently fall back to a reproducibility digest.  Keep the name
+            # short as well: some registry backends enforce a 63-character
+            # component limit.
+            raw_name = re.sub(r"[^a-z0-9-]+", "-", f"zero-{sandbox_id}".lower()).strip("-")
+            identity = hashlib.sha256(sandbox_id.encode("utf-8")).hexdigest()[:8]
+            name = f"{raw_name[:36].rstrip('-')}-{identity}-{int(time.time())}"
             try:
                 proc = self._lbg(
                     ["sdbx", "image", "commit",

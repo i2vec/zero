@@ -26,6 +26,7 @@ class ResourceRef:
     name: str
     version: str
     host_path: str
+    source: Optional[str] = None
 
     def uri(self) -> str:
         return f"{self.kind}://{self.name}/{self.version}"

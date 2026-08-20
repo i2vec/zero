@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import parse_qs, urlsplit
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
@@ -35,11 +36,19 @@ from zero.protocol.spec import (
     ModelRequest,
 )
 from zero.protocol.status import (
-    DecisionRequest,
+    DecisionCandidate, DecisionRequest,
     EnvironmentResponse,
     EnvironmentStatus,
 )
+from zero.protocol.resources import (
+    ArtifactRef, ResourceKind, ResourceLockEntry, VerificationEvidence,
+)
 from zero.resources.cache import CachedResource, ResourceCache
+from zero.resources.deploy_master import BuildToolRequest, DeployMasterClient
+from zero.resources.errors import ResourceIntegrationError
+from zero.resources.locks import ResourceLockStore, lock_digest, validate_release_lock
+from zero.resources.registry import ResourceRegistry
+from zero.resources.trisol import TrisolClient
 from zero.sandbox.base import MountSpec, ResourceRef
 from zero.sandbox.manager import SandboxManager
 from zero.skills.candidates import SkillCandidates, SkillProposal
@@ -57,12 +66,65 @@ def _dedupe(names) -> list[str]:
     return list(seen)
 
 
+def _trisol_provenance(uri: str) -> dict[str, Any]:
+    parsed = urlsplit(uri)
+    if parsed.scheme != "trisol":
+        return {}
+    parts = parsed.path.strip("/").split("/")
+    query = parse_qs(parsed.query)
+    return {
+        "trisol_id": parts[0] if parts else None,
+        "trisol_version": parts[1] if len(parts) > 1 else None,
+        "trisol_team": (query.get("team") or [None])[0],
+        "trisol_splits": query.get("split", []),
+    }
+
+
+def _verification_failed(report: VerificationReport) -> bool:
+    """Return true when any release-critical verification has failed."""
+    return any(
+        status == "failed"
+        for status in (
+            report.package_import,
+            report.tool_healthcheck,
+            report.model_load,
+            report.dataset_read,
+        )
+    )
+
+
 def _text(obj: Any) -> dict:
     if isinstance(obj, str):
         payload = obj
     else:
         payload = json.dumps(obj, ensure_ascii=False, indent=2, default=str)
     return {"content": [{"type": "text", "text": payload}]}
+
+
+async def _build_tool_resource(ctx: "LabwrightContext", args: dict[str, Any]) -> dict:
+    """Calling-side contract for the Deploy Master MCP tool."""
+    if ctx.deploy_master is None:
+        return _text({"ok": False, "error": "Deploy Master is not configured"})
+    try:
+        request_args = dict(args)
+        max_rebuilds = int(request_args.pop("max_rebuilds", 0) or 0)
+        request = BuildToolRequest.model_validate(request_args)
+        ctx.emit("labwright", "deploymaster_build_submitted", {
+            "request_id": ctx.request_id, "max_rebuilds": max_rebuilds,
+        })
+        built = await ctx.deploy_master.build(request, max_rebuilds=max_rebuilds)
+        ctx.emit("labwright", "deploymaster_build_finished", {
+            "request_id": ctx.request_id, "task_id": built.task_id,
+            "status": "succeeded", "has_image_digest": bool(built.image_digest),
+            "build_attempts": built.build_attempts,
+        })
+        return _text({"ok": True, "artifact": built.model_dump(mode="json")})
+    except (ValueError, ResourceIntegrationError) as exc:
+        ctx.emit("labwright", "deploymaster_build_finished", {
+            "request_id": ctx.request_id, "status": "failed",
+            "error_type": type(exc).__name__,
+        })
+        return _text({"ok": False, "error_type": type(exc).__name__, "error": str(exc)[:500]})
 
 
 def _persist_environment_baseline(ctx: "LabwrightContext", manifest: EnvironmentManifest) -> None:
@@ -117,6 +179,11 @@ class LabwrightContext:
     sandbox_manifest: dict[str, EnvironmentManifest] = field(default_factory=dict)
     sandbox_spec: dict[str, EnvironmentSpec] = field(default_factory=dict)
     skill_candidates: Optional[SkillCandidates] = None
+    registry: Optional[ResourceRegistry] = None
+    trisol: Optional[TrisolClient] = None
+    deploy_master: Optional[DeployMasterClient] = None
+    lock_store: Optional[ResourceLockStore] = None
+    registry_lookup_unavailable: bool = False
 
     def set_request(self, request_id: str, spec: EnvironmentSpec, *,
                     sandbox_id: Optional[str] = None) -> None:
@@ -152,7 +219,7 @@ def build_labenv_server(ctx: LabwrightContext):
         for m in mounts_in:
             ref = ResourceRef(
                 kind=m["kind"], name=m["name"], version=m.get("version") or "main",
-                host_path=m["host_path"],
+                host_path=m["host_path"], source=m.get("source"),
             )
             mounts.append(MountSpec(ref=ref, read_only=True))
         python = args.get("python_version") or (
@@ -255,6 +322,30 @@ def build_labenv_server(ctx: LabwrightContext):
         kind = args["kind"]
         name = args["name"]
         override = ctx.source_overrides.get(name) or args.get("source") or None
+        if override is None and ctx.registry is not None and kind in {"model", "dataset"}:
+            try:
+                candidates = await ctx.registry.search(
+                    kind=ResourceKind(kind), text=name, limit=10,
+                    language="en-US", constraints={}, required_capabilities=[],
+                )
+                exact = [candidate for candidate in candidates if candidate.match == "exact"]
+                usable = exact if len(exact) == 1 else candidates
+                if len(usable) == 1:
+                    override = usable[0].artifact.uri
+                elif len(usable) > 1:
+                    decision = DecisionRequest(
+                        resource_type=kind, resource_name=name,
+                        reason=f"Literature Sage returned multiple materializable {kind} assets",
+                        candidates=[DecisionCandidate(
+                            id=f"sage-{index}", source=candidate.artifact.uri,
+                            note=f"{candidate.name} ({candidate.resource_unique_key})",
+                        ) for index, candidate in enumerate(usable)],
+                        scientific_impact="不同资产 ID 或版本可能改变实验结果，必须显式选择",
+                    )
+                    return _text({"ok": False, "needs_decision": True,
+                                  "decision": decision.model_dump(exclude_none=True)})
+            except ResourceIntegrationError:
+                ctx.registry_lookup_unavailable = True
         if kind == "model":
             req = ModelRequest(
                 name=name,
@@ -321,13 +412,16 @@ def build_labenv_server(ctx: LabwrightContext):
             return _text({"ok": False, "error": "no sandbox_id"})
         version = args.get("version") or "main"
         host_path = args.get("host_path")
+        source = None
         if not host_path:
             cached = ctx.collected.get(f"{args['kind']}:{args['name']}")
             if cached is None:
                 return _text({"ok": False, "error": "resource not collected; call collect_resource first"})
             host_path = cached.host_path
             version = cached.version
-        ref = ResourceRef(kind=args["kind"], name=args["name"], version=version, host_path=host_path)
+            source = cached.source
+        ref = ResourceRef(kind=args["kind"], name=args["name"], version=version,
+                          host_path=host_path, source=source)
         path = await asyncio.to_thread(ctx.manager.mount, sid, MountSpec(ref=ref, read_only=True))
         ctx.emit("labwright", "resource_mounted", {
             "request_id": ctx.request_id, "sandbox_id": sid,
@@ -377,6 +471,151 @@ def build_labenv_server(ctx: LabwrightContext):
         return _text({"ok": False, "error": f"unknown kind {kind}"})
 
     @tool(
+        "search_resource",
+        "优先查询 Literature Sage。一次调用自动完成 Search + Detail，并过滤停用、"
+        "缺制品或不满足硬约束的候选。只用于 tool/model/dataset。",
+        {
+            "kind": str, "text": str, "keywords": dict, "language": str,
+            "limit": int, "required_capabilities": list, "constraints": dict,
+        },
+    )
+    async def search_resource(args):
+        if ctx.registry is None:
+            ctx.registry_lookup_unavailable = True
+            return _text({"ok": False, "degraded": True, "error": "resource registry disabled"})
+        try:
+            kind = ResourceKind(args["kind"])
+            ctx.emit("labwright", "resource_search_started", {
+                "request_id": ctx.request_id, "kind": kind.value,
+                "text": str(args.get("text") or "")[:200],
+            })
+            candidates = await ctx.registry.search(
+                kind=kind, text=args.get("text") or "",
+                keywords=args.get("keywords") or {}, language=args.get("language") or "en-US",
+                limit=max(1, min(int(args.get("limit") or 10), 50)),
+                required_capabilities=args.get("required_capabilities") or [],
+                constraints=args.get("constraints") or {},
+            )
+            ctx.emit("labwright", "resource_search_finished", {
+                "request_id": ctx.request_id, "kind": kind.value,
+                "candidate_count": len(candidates), "status": "ok",
+            })
+            return _text({"ok": True, "candidates": [c.model_dump(mode="json") for c in candidates]})
+        except (ValueError, ResourceIntegrationError) as exc:
+            ctx.registry_lookup_unavailable = True
+            ctx.emit("labwright", "resource_search_finished", {
+                "request_id": ctx.request_id, "status": "degraded",
+                "error_type": type(exc).__name__,
+            })
+            return _text({"ok": False, "degraded": True, "error_type": type(exc).__name__, "error": str(exc)[:500]})
+
+    @tool(
+        "build_tool_resource",
+        "Literature Sage 未命中 tool 时，调用 Deploy Master 从固定代码仓库构建并验证 OCI 镜像。"
+        "返回的制品仍须在本题 Sandbox 验证，再用 publish_resource 入库并写 lock。",
+        {
+            "github_url": str, "build_instructions": str, "verify_commands": list,
+            "dockerfile_path": str, "build_context": str,
+            "repository_dockerfile_policy": str, "max_rebuilds": int,
+        },
+    )
+    async def build_tool_resource(args):
+        return await _build_tool_resource(ctx, args)
+
+    @tool(
+        "publish_resource",
+        "把已物化且已验证的 tool/model/dataset 复用或写入 Literature Sage，并写入"
+        "resources.lock.json。已有相同制品会幂等复用；不同制品绝不覆盖。",
+        {
+            "kind": str, "requirement_id": str, "resource_unique_key": str,
+            "resolution": str, "metadata": dict, "artifact": dict,
+            "verification": dict, "capabilities": list, "provenance": dict,
+        },
+    )
+    async def publish_resource(args):
+        if ctx.lock_store is None:
+            return _text({"ok": False, "error": "resource lock storage unavailable"})
+        try:
+            kind = ResourceKind(args["kind"])
+            artifact = ArtifactRef.model_validate(args["artifact"])
+            verification = VerificationEvidence.model_validate(args["verification"])
+            if verification.status != "passed":
+                return _text({"ok": False, "error": "verification.status must be passed"})
+            if ctx.config.resource_release_strict and not artifact.digest:
+                return _text({"ok": False, "error": "strict release requires immutable artifact digest"})
+            if kind == ResourceKind.TOOL and artifact.type != "oci_image":
+                return _text({"ok": False, "error": "tool artifacts must be OCI images"})
+            if kind != ResourceKind.TOOL and artifact.type == "oci_image":
+                return _text({"ok": False, "error": "model/dataset artifacts cannot be OCI images"})
+            if kind in (ResourceKind.MODEL, ResourceKind.DATASET):
+                requirement_name = str(args["requirement_id"]).partition(":")[2]
+                cached = ctx.collected.get(f"{kind.value}:{requirement_name}")
+                if cached is None:
+                    return _text({
+                        "ok": False,
+                        "error": "model/dataset must be materialized with collect_resource before locking",
+                    })
+                if not cached.sha256 or artifact.digest != cached.sha256:
+                    return _text({
+                        "ok": False,
+                        "error": "artifact digest does not match materialized content",
+                        "expected_digest": cached.sha256,
+                    })
+                source = cached.source or ""
+                if not source.startswith("trisol://"):
+                    if ctx.trisol is None:
+                        return _text({"ok": False, "error": "Trisol publishing is not configured"})
+                    uploaded = await asyncio.to_thread(
+                        ctx.trisol.publish, kind.value, args["resource_unique_key"],
+                        Path(cached.host_path), cached.sha256,
+                        str((args.get("metadata") or {}).get("description") or "Zero verified asset"),
+                    )
+                    source = uploaded.uri()
+                    cached.source = source
+                artifact = artifact.model_copy(update={
+                    "type": "object_bundle", "uri": source, "digest": cached.sha256,
+                    "version": cached.version,
+                })
+            unique_key = args["resource_unique_key"]
+            candidate = None
+            if ctx.registry is not None and ctx.config.resource_publish_enabled:
+                ctx.emit("labwright", "resource_publish_started", {
+                    "request_id": ctx.request_id, "kind": kind.value,
+                    "resource_unique_key": unique_key,
+                })
+                candidate = await ctx.registry.publish(
+                    kind=kind, unique_key=unique_key,
+                    metadata=args.get("metadata") or {}, artifact=artifact,
+                    verification=verification, capabilities=args.get("capabilities") or [],
+                )
+            resolution = args.get("resolution") or "existing"
+            entry = ResourceLockEntry(
+                requirement_id=args["requirement_id"], kind=kind,
+                resource_ref=f"literature-sage:{kind.value}:{unique_key}",
+                resolution=resolution, artifact=artifact, verification=verification,
+                provenance={**(args.get("provenance") or {}),
+                            **_trisol_provenance(artifact.uri),
+                            "registry_lookup": "unavailable" if ctx.registry_lookup_unavailable else "available"},
+            )
+            digest = ctx.lock_store.put(entry)
+            ctx.emit("labwright", "resource_lock_written", {
+                "request_id": ctx.request_id, "requirement_id": entry.requirement_id,
+                "resources_lock_digest": digest,
+            })
+            ctx.emit("labwright", "resource_publish_finished", {
+                "request_id": ctx.request_id, "kind": kind.value, "status": "ok",
+            })
+            return _text({
+                "ok": True, "resource_ref": entry.resource_ref,
+                "resources_lock_digest": digest,
+                "candidate": candidate.model_dump(mode="json") if candidate else None,
+                "artifact": artifact.model_dump(mode="json"),
+                "warnings": [] if artifact.digest else ["mutable_reference"],
+            })
+        except (ValueError, ResourceIntegrationError) as exc:
+            return _text({"ok": False, "error_type": type(exc).__name__, "error": str(exc)[:500]})
+
+    @tool(
         "publish_manifest",
         "验证通过后：冻结 **env** Sandbox（inventory + image commit），再自动生成干净的 "
         "**exp** Sandbox；返回给 Researcher 的是 exp sandbox_id。"
@@ -393,6 +632,26 @@ def build_labenv_server(ctx: LabwrightContext):
         sid = args.get("sandbox_id") or ctx.sandbox_id
         if not sid or ctx.spec is None:
             return _text({"ok": False, "error": "need sandbox_id and an active spec"})
+        required_resources = {
+            **{f"tool:{item.name}": "tool" for item in ctx.spec.tools},
+            **{f"model:{item.name}": "model" for item in ctx.spec.models},
+            **{f"dataset:{item.name}": "dataset" for item in ctx.spec.datasets},
+        }
+        resources_lock_digest = None
+        resource_lock = None
+        if required_resources:
+            if ctx.lock_store is None:
+                return _text({"ok": False, "error": "required resources have no lock store"})
+            resource_lock = ctx.lock_store.read()
+            violations = validate_release_lock(
+                resource_lock,
+                required_resources,
+                require_immutable=ctx.config.resource_release_strict,
+            )
+            if violations:
+                return _text({"ok": False, "error": "required resources must be locked and verified",
+                              "violations": violations})
+            resources_lock_digest = lock_digest(resource_lock)
         handle = ctx.manager.get_handle(sid)
         if handle is None:
             return _text({"ok": False, "error": f"unknown sandbox {sid}"})
@@ -455,7 +714,7 @@ def build_labenv_server(ctx: LabwrightContext):
         if datasets:
             ver.dataset_read = "passed" if ds_ok else "failed"
 
-        if ver.package_import == "failed" or ver.model_load == "failed" or ver.dataset_read == "failed":
+        if _verification_failed(ver):
             return _text({
                 "ok": False,
                 "error": "verification failed; fix resources before publishing",
@@ -495,6 +754,7 @@ def build_labenv_server(ctx: LabwrightContext):
             verification=ver,
             image_digest=digest,
             package_lock={n: e.version for n, e in packages.items()},
+            resources_lock_digest=resources_lock_digest,
         )
 
         # Probe freeze for degraded spawn + inventory before spawning exp.
@@ -551,7 +811,7 @@ def build_labenv_server(ctx: LabwrightContext):
             if as_added else
             "环境已就绪（env 已冻结；已生成干净 exp Sandbox）"
         )
-        ctx.response = EnvironmentResponse(
+        response = EnvironmentResponse(
             status=status, request_id=ctx.request_id, sandbox_id=exp_handle.sandbox_id,
             manifest=manifest, message=msg,
             detail={
@@ -561,14 +821,6 @@ def build_labenv_server(ctx: LabwrightContext):
                 "spawn_mode": exp_handle.spawn_mode,
             },
         )
-        ctx.sandbox_manifest[sid] = env_manifest
-        ctx.sandbox_manifest[exp_handle.sandbox_id] = manifest
-        ctx.sandbox_spec[sid] = ctx.spec
-        ctx.sandbox_spec[exp_handle.sandbox_id] = ctx.spec
-        ctx.env_sandbox_id = sid
-        ctx.exp_sandbox_id = exp_handle.sandbox_id
-        ctx.sandbox_id = exp_handle.sandbox_id
-
         try:
             base_image = ""
             if ctx.spec is not None and ctx.spec.base_environment is not None:
@@ -587,12 +839,31 @@ def build_labenv_server(ctx: LabwrightContext):
                 spawn_mode=exp_handle.spawn_mode,
                 env_sandbox_id=sid,
                 exp_sandbox_id=exp_handle.sandbox_id,
+                resource_lock=resource_lock,
             )
             ctx.last_environment_id = inventory.environment_id
             exp_handle.environment_id = inventory.environment_id
         except Exception as exc:  # noqa: BLE001
             ctx.emit("labwright", "inventory_failed", {"error": str(exc)[:500]})
             _persist_environment_baseline(ctx, env_manifest)
+            return _text({
+                "ok": False,
+                "error": f"environment inventory validation failed: {exc}",
+                "env_sandbox_id": sid,
+                "exp_sandbox_id": exp_handle.sandbox_id,
+                "image_digest": digest,
+            })
+
+        # Publish READY state only after the release inventory and its
+        # lock/Manifest/mount consistency checks have completed successfully.
+        ctx.response = response
+        ctx.sandbox_manifest[sid] = env_manifest
+        ctx.sandbox_manifest[exp_handle.sandbox_id] = manifest
+        ctx.sandbox_spec[sid] = ctx.spec
+        ctx.sandbox_spec[exp_handle.sandbox_id] = ctx.spec
+        ctx.env_sandbox_id = sid
+        ctx.exp_sandbox_id = exp_handle.sandbox_id
+        ctx.sandbox_id = exp_handle.sandbox_id
 
         ctx.emit("labwright", "manifest_published", {
             "request_id": ctx.request_id,
@@ -601,6 +872,7 @@ def build_labenv_server(ctx: LabwrightContext):
             "status": status.value,
             "spawn_mode": exp_handle.spawn_mode,
             "environment_id": ctx.last_environment_id,
+            "resources_lock_digest": resources_lock_digest,
         })
         return _text({
             "ok": True,
@@ -714,7 +986,8 @@ def build_labenv_server(ctx: LabwrightContext):
         "labenv", "1.0.0",
         [
             create_sandbox, sandbox_exec, collect_resource, mount_resource,
-            verify_resource, publish_manifest, request_researcher_decision, mark_failed,
+            verify_resource, search_resource, build_tool_resource, publish_resource, publish_manifest,
+            request_researcher_decision, mark_failed,
             propose_reusable_skill,
         ],
     )

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -21,6 +23,27 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 def _env_path(key: str, default: Path) -> Path:
     raw = os.environ.get(key)
     return Path(raw).expanduser().resolve() if raw else default
+
+
+def _default_lbg_bin() -> str:
+    """Select only the Bohrium CLI variant that actually provides ``sdbx``."""
+    candidates = [
+        "/personal/conda_envs/paper2arm/bin/lbg",
+        str(Path(sys.executable).with_name("lbg")),
+        shutil.which("lbg") or "",
+    ]
+    for candidate in dict.fromkeys(value for value in candidates if value):
+        if not Path(candidate).is_file():
+            continue
+        try:
+            probe = subprocess.run(
+                [candidate, "sdbx", "--help"], capture_output=True, timeout=5, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            return candidate
+    return "lbg"
 
 
 def _load_project_dotenv() -> None:
@@ -83,7 +106,7 @@ class Config:
     # --- Bohrium cloud sandbox backend (``lbg``) -------------------------
     # Both CLIs are driven as subprocesses; the ``bohr`` binary is usually not
     # on PATH (image discovery), while ``lbg`` normally is (sandbox lifecycle).
-    lbg_bin: str = field(default_factory=lambda: os.environ.get("ZERO_LBG_BIN", "lbg"))
+    lbg_bin: str = field(default_factory=lambda: os.environ.get("ZERO_LBG_BIN", _default_lbg_bin()))
     bohr_bin: str = field(default_factory=lambda: os.environ.get("ZERO_BOHR_BIN", "/root/.bohrium/bohr"))
     # Auto-destroy lifetime (seconds) for each created sandbox; bounds cost if a
     # run is abandoned. Align with ``lbg``'s own default (12h) so long CPU/GPU
@@ -94,6 +117,15 @@ class Config:
     # Optional project id: when set, sandboxes bill to that project's budget
     # instead of the personal wallet (passed as ``--project-id``).
     lbg_project_id: str = field(default_factory=lambda: os.environ.get("ZERO_LBG_PROJECT_ID", ""))
+    # Trisol is a system CLI (not a Python package). LBG sandboxes install it
+    # from this endpoint and verify the binary before Researcher handoff.
+    trisol_install_url: str = field(default_factory=lambda: os.environ.get(
+        "ZERO_TRISOL_INSTALL_URL", "https://trisol.dp.tech/install.sh"))
+    trisol_bin: str = field(default_factory=lambda: os.environ.get("ZERO_TRISOL_BIN", "trisol"))
+    trisol_api_url: str = field(default_factory=lambda: os.environ.get(
+        "TRISOL_API_URL", "https://trisol.dp.tech"))
+    trisol_team: str = field(default_factory=lambda: os.environ.get("TRISOL_TEAM", ""))
+    trisol_token: str = field(default_factory=lambda: os.environ.get("TRISOL_TOKEN", ""))
     # Completion waits for an LBG image commit so environment.json can record
     # its real imageUrl. Set 0 to only persist the async commit id.
     lbg_image_wait_timeout: int = field(default_factory=lambda: int(
@@ -133,6 +165,35 @@ class Config:
     # output) into ``runs/<id>/deliverables/``. This cap is a safety net so a
     # stray dataset/weight file cannot bloat the run.
     export_max_file_mb: int = field(default_factory=lambda: int(os.environ.get("ZERO_EXPORT_MAX_FILE_MB", "50")))
+
+    # Cross-run resource catalog and tool builder. Tokens remain host-side and
+    # are never included in prompts, traces, locks, or exported metadata.
+    literature_sage_base_url: str = field(default_factory=lambda: os.environ.get(
+        "LITERATURE_SAGE_BASE_URL", "https://literature-sage.test.bohrium.com"))
+    literature_sage_timeout_sec: float = field(default_factory=lambda: float(os.environ.get(
+        "LITERATURE_SAGE_TIMEOUT_SEC", "30")))
+    literature_sage_max_connections: int = field(default_factory=lambda: int(os.environ.get(
+        "LITERATURE_SAGE_MAX_CONNECTIONS", "1")))
+    literature_sage_max_retries: int = field(default_factory=lambda: int(os.environ.get(
+        "LITERATURE_SAGE_MAX_RETRIES", "4")))
+    literature_sage_auth_token: str = field(default_factory=lambda: os.environ.get(
+        "LITERATURE_SAGE_AUTH_TOKEN", ""))
+    literature_sage_proxy_url: str = field(default_factory=lambda: os.environ.get(
+        "LITERATURE_SAGE_PROXY_URL", ""))
+    deploy_master_base_url: str = field(default_factory=lambda: os.environ.get(
+        "DEPLOY_MASTER_BASE_URL", ""))
+    deploy_master_poll_interval_sec: float = field(default_factory=lambda: float(os.environ.get(
+        "DEPLOY_MASTER_POLL_INTERVAL_SEC", "5")))
+    deploy_master_build_deadline_sec: float = field(default_factory=lambda: float(os.environ.get(
+        "DEPLOY_MASTER_BUILD_DEADLINE_SEC", "3600")))
+    deploy_master_auth_token: str = field(default_factory=lambda: os.environ.get(
+        "DEPLOY_MASTER_AUTH_TOKEN", ""))
+    resource_registry_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "ZERO_RESOURCE_REGISTRY_ENABLED", "1").strip().lower() not in ("0", "false", "no", ""))
+    resource_publish_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "ZERO_RESOURCE_PUBLISH_ENABLED", "1").strip().lower() not in ("0", "false", "no", ""))
+    resource_release_strict: bool = field(default_factory=lambda: os.environ.get(
+        "ZERO_RESOURCE_RELEASE_STRICT", "0").strip().lower() not in ("0", "false", "no", ""))
 
     @property
     def runs_dir(self) -> Path:

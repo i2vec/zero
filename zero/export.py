@@ -68,12 +68,16 @@ def export_run(
                 json.dumps(environment, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
+        assets_path = _write_asset_summary(run_dir, environment or {})
 
         trace_dir = run_dir / "trace"
         payload = {
             "task_id": task_id,
             "status": status,
             "backend": backend,
+            # Keep the structured environment inline for API consumers. The
+            # standalone environment.json remains the reproducibility artifact.
+            "environment": environment or {},
             "sandbox_ids": sandbox_ids,
             "prompt": prompt,
             "created_at": time.time(),
@@ -88,6 +92,7 @@ def export_run(
                 "environment_md": (environment or {}).get("environment_md"),
                 "inventory": (environment or {}).get("inventory_path"),
                 "image_url": ((environment or {}).get("image") or {}).get("url"),
+                "assets": str(assets_path) if assets_path else None,
                 "grading": str(run_dir / "grading" / "result.json")
                 if (run_dir / "grading" / "result.json").is_file()
                 else None,
@@ -99,6 +104,8 @@ def export_run(
                 "trace": str(trace_dir),
                 "teacher": str(run_dir / "teacher"),
                 "resources": str(run_dir / "resources"),
+                "resources_lock": str(run_dir / "resources.lock.json")
+                if (run_dir / "resources.lock.json").is_file() else None,
                 "logs": str(run_dir / "logs"),
                 "grading": str(run_dir / "grading"),
                 "environment": str(run_dir / "environment"),
@@ -114,6 +121,52 @@ def export_run(
         return run_dir
     except Exception:  # noqa: BLE001 - export must never break a run
         return None
+
+
+def _write_asset_summary(run_dir: Path, environment: dict) -> Optional[Path]:
+    """Expose all release identifiers in one machine-readable handoff file."""
+    lock_path = run_dir / "resources.lock.json"
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8")) if lock_path.is_file() else {}
+    except (OSError, json.JSONDecodeError):
+        lock = {}
+    grouped: dict[str, list[dict]] = {"tools": [], "datasets": [], "models": []}
+    for entry in lock.get("entries", []):
+        kind = str(entry.get("kind") or "")
+        bucket = {"tool": "tools", "dataset": "datasets", "model": "models"}.get(kind)
+        if not bucket:
+            continue
+        artifact = entry.get("artifact") or {}
+        provenance = entry.get("provenance") or {}
+        resource_ref = str(entry.get("resource_ref") or "")
+        grouped[bucket].append({
+            "requirement_id": entry.get("requirement_id"),
+            "resource_unique_key": resource_ref.rsplit(":", 1)[-1] if resource_ref else None,
+            "artifact_uri": artifact.get("uri"),
+            "artifact_digest": artifact.get("digest"),
+            "artifact_type": artifact.get("type"),
+            "artifact_version": artifact.get("version"),
+            "trisol_id": provenance.get("trisol_id"),
+            "trisol_version": provenance.get("trisol_version"),
+            "trisol_team": provenance.get("trisol_team"),
+            "trisol_splits": provenance.get("trisol_splits") or [],
+            "verification": (entry.get("verification") or {}).get("status"),
+        })
+    image = environment.get("image") or {}
+    payload = {
+        "schema_version": 1,
+        "task_image": {
+            "uri": image.get("url"), "status": image.get("status"),
+            "digest": image.get("digest"), "commit_id": image.get("commit_id"),
+        },
+        **grouped,
+    }
+    path = run_dir / "assets.json"
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    return path
 
 
 def _collect_export(

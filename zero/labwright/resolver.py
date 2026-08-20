@@ -18,6 +18,7 @@ from typing import Optional
 from zero.protocol.spec import DatasetRequest, ModelRequest, PackageRequest
 from zero.protocol.status import DecisionCandidate, DecisionRequest
 from zero.resources.cache import CachedResource, ResourceCache
+from zero.resources.trisol import TrisolClient
 
 
 @dataclass
@@ -39,8 +40,9 @@ def pip_spec(pkg: PackageRequest) -> str:
 
 
 class Resolver:
-    def __init__(self, cache: ResourceCache):
+    def __init__(self, cache: ResourceCache, trisol: Optional[TrisolClient] = None):
         self._cache = cache
+        self._trisol = trisol
 
     # ----- models --------------------------------------------------------- #
     def resolve_model(self, req: ModelRequest, override_source: Optional[str] = None) -> Resolution:
@@ -61,15 +63,23 @@ class Resolver:
         return self._collect_model(req, source, revision)
 
     def _collect_model(self, req: ModelRequest, source: str, revision: str) -> Resolution:
+        if source.startswith("trisol://"):
+            return self._collect_trisol("model", req.name, source, req.revision)
         dest = self._cache.path_for("model", req.name, revision)
         try:
-            repo_id = source.split("hf://", 1)[-1].split("@", 1)[0]
-            from huggingface_hub import snapshot_download
-            local = snapshot_download(repo_id=repo_id, revision=req.revision, local_dir=str(dest))
+            if source.startswith("http://") or source.startswith("https://"):
+                self._download_url(source, dest)
+                local = dest
+                pinned = source
+            else:
+                repo_id = source.split("hf://", 1)[-1].split("@", 1)[0]
+                from huggingface_hub import snapshot_download
+                local = snapshot_download(repo_id=repo_id, revision=req.revision, local_dir=str(dest))
+                pinned = f"hf://{repo_id}@{req.revision or revision}"
             sha = _dir_digest(Path(local))
             res = self._cache.record(CachedResource(
                 kind="model", name=req.name, version=revision, host_path=str(dest),
-                source=f"hf://{repo_id}@{req.revision or revision}", sha256=sha,
+                source=pinned, sha256=sha,
             ))
             return Resolution(resource=res)
         except Exception as exc:  # noqa: BLE001
@@ -94,6 +104,8 @@ class Resolver:
         return self._collect_dataset(req, source, version)
 
     def _collect_dataset(self, req: DatasetRequest, source: str, version: str) -> Resolution:
+        if source.startswith("trisol://"):
+            return self._collect_trisol("dataset", req.name, source, req.version)
         dest = self._cache.path_for("dataset", req.name, version)
         try:
             if source.startswith("http://") or source.startswith("https://"):
@@ -113,6 +125,31 @@ class Resolver:
             return Resolution(resource=res)
         except Exception as exc:  # noqa: BLE001
             return Resolution(unavailable=f"dataset collection failed: {exc}")
+
+    def _collect_trisol(self, kind: str, name: str, source: str,
+                        requested_version: Optional[str]) -> Resolution:
+        if self._trisol is None:
+            return Resolution(unavailable="Trisol is not configured")
+        try:
+            from urllib.parse import urlsplit
+            parsed = urlsplit(source)
+            asset_id = parsed.path.strip("/").split("/", 1)[0]
+            asset = self._trisol.resolve(kind, asset_id, requested_version)
+            cached = self._cache.get(kind, name, asset.version_code)
+            if cached and cached.source == asset.uri():
+                return Resolution(resource=cached, notes=["Trisol cache hit"])
+            dest = self._cache.path_for(kind, name, asset.version_code)
+            self._trisol.materialize(asset.uri(), dest)
+            sha = _dir_digest(dest)
+            resource = self._cache.record(CachedResource(
+                kind=kind, name=name, version=asset.version_code,
+                host_path=str(dest), source=asset.uri(), sha256=sha,
+            ))
+            return Resolution(resource=resource, notes=[
+                f"Trisol ID {asset.asset_id}", f"version {asset.version_name} ({asset.version_code})",
+            ])
+        except Exception as exc:  # noqa: BLE001
+            return Resolution(unavailable=f"Trisol {kind} collection failed: {exc}")
 
     # ----- helpers -------------------------------------------------------- #
     def _search_hf(self, name: str, kind: str) -> list[DecisionCandidate]:
@@ -157,6 +194,9 @@ def _dir_digest(path: Path) -> str:
     h = hashlib.sha256()
     for p in sorted(path.rglob("*")):
         if p.is_file():
-            h.update(p.name.encode())
-            h.update(str(p.stat().st_size).encode())
-    return h.hexdigest()[:32]
+            h.update(str(p.relative_to(path)).encode())
+            h.update(b"\0")
+            with p.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    h.update(chunk)
+    return "sha256:" + h.hexdigest()

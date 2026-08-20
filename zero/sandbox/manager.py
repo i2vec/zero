@@ -287,9 +287,18 @@ class SandboxManager:
             ref = image_info.get("reference") or f"zero-sandbox:{env_sandbox_id}"
             return ref, "from_image"
         if self.backend == "lbg":
+            commit_id = image_info.get("commit_id")
             url = image_info.get("url")
-            if url and image_info.get("status") == "ready":
-                return str(url), "from_image"
+            if image_info.get("status") == "ready":
+                # Prefer the immutable ``lbg:commit:<id>`` reference: a committed
+                # image's ``imageUrl`` carries a mutable ``:latest`` tag, which
+                # recent lbg CLIs reject for ``template create`` (prewarm-cache
+                # churn). ``lbg:commit:<id>`` is stable, cache-friendly, and the
+                # form lbg itself resolves for committed images.
+                if commit_id:
+                    return f"lbg:commit:{commit_id}", "from_image"
+                if url:
+                    return str(url), "from_image"
             # Fall back: same base image family as the env sandbox, reinstall pkgs.
             parent = self._specs.get(env_sandbox_id)
             base = (parent.base_image if parent and parent.base_image else "") or self._config.docker_base_image

@@ -43,6 +43,11 @@ from zero.protocol.status import (
     ResearcherDecision,
 )
 from zero.resources.cache import ResourceCache
+from zero.resources.deploy_master import DeployMasterClient
+from zero.resources.literature_sage import LiteratureSageClient
+from zero.resources.locks import ResourceLockStore
+from zero.resources.registry import ResourceRegistry
+from zero.resources.trisol import TrisolClient
 from zero.sandbox.manager import SandboxManager
 from zero.skills.candidates import SkillCandidates
 
@@ -65,14 +70,44 @@ class LabwrightService:
         self._emit = emit or (lambda a, e, d: None)
         self._on_agent_event = on_agent_event
 
+        self._registry_client = None
+        self._deploy_master_client = None
+        registry = None
+        if config.resource_registry_enabled:
+            self._registry_client = LiteratureSageClient(
+                config.literature_sage_base_url,
+                timeout=config.literature_sage_timeout_sec,
+                max_connections=config.literature_sage_max_connections,
+                max_retries=config.literature_sage_max_retries,
+                auth_token=config.literature_sage_auth_token,
+                proxy_url=config.literature_sage_proxy_url,
+            )
+            registry = ResourceRegistry(self._registry_client)
+        if config.deploy_master_base_url:
+            self._deploy_master_client = DeployMasterClient(
+                config.deploy_master_base_url,
+                poll_interval=config.deploy_master_poll_interval_sec,
+                deadline=config.deploy_master_build_deadline_sec,
+                auth_token=config.deploy_master_auth_token,
+            )
+        trisol = TrisolClient(
+            binary=config.trisol_bin, team=config.trisol_team,
+            api_url=config.trisol_api_url, token=config.trisol_token,
+        )
         self._ctx = LabwrightContext(
             config=config,
             manager=manager,
-            resolver=Resolver(ResourceCache(config.run_resources_dir(task_id))),
+            resolver=Resolver(ResourceCache(config.run_resources_dir(task_id)), trisol=trisol),
             verifier=Verifier(manager),
             task_id=task_id,
             emit=self._emit,
             skill_candidates=skill_candidates,
+            registry=registry,
+            trisol=trisol,
+            deploy_master=self._deploy_master_client,
+            lock_store=ResourceLockStore(
+                config.run_dir(task_id) / "resources.lock.json", task_id,
+            ),
         )
         self._agent = LabwrightAgent(
             config, task_id=task_id, ctx=self._ctx,
@@ -254,6 +289,10 @@ class LabwrightService:
 
     async def close(self) -> None:
         await self._agent.close()
+        if self._registry_client is not None:
+            await self._registry_client.aclose()
+        if self._deploy_master_client is not None:
+            await self._deploy_master_client.aclose()
 
     async def prepare_external_task(
         self, preparer: ExternalTaskPreparer, workspace: str,

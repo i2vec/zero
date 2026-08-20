@@ -69,6 +69,7 @@ class EnvironmentManifest(BaseModel):
     # Reproducibility bindings (doc section 16).
     image_digest: Optional[str] = None
     package_lock: dict[str, str] = Field(default_factory=dict)
+    resources_lock_digest: Optional[str] = None
 
     def researcher_summary(self) -> str:
         """The compact view the Researcher sees (doc section 13 tail)."""

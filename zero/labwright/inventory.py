@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -16,9 +17,49 @@ from zero.protocol.environment_inventory import (
     ToolInventoryEntry,
 )
 from zero.protocol.manifest import EnvironmentManifest
+from zero.protocol.resources import ResourceLock
+from zero.resources.locks import lock_digest
 from zero.sandbox.manager import SandboxManager
 
 _ENV_DIR = "environment"
+_BASELINE_TOOLS = (
+    ("python", "python3"),
+    ("pip", "pip"),
+    ("bash", "bash"),
+    ("git", "git"),
+)
+
+
+def validate_inventory_lock_consistency(
+    manifest: EnvironmentManifest,
+    inventory: EnvironmentInventory,
+    lock: ResourceLock,
+) -> list[str]:
+    """Cross-check the immutable bindings copied into release artifacts."""
+    errors: list[str] = []
+    actual_digest = lock_digest(lock)
+    if manifest.resources_lock_digest != actual_digest:
+        errors.append("manifest_lock_digest_mismatch")
+    if inventory.resources_lock_digest != actual_digest:
+        errors.append("inventory_lock_digest_mismatch")
+    entries = {entry.requirement_id: entry for entry in lock.entries}
+    mounts = {(mount.kind, mount.name): mount for mount in inventory.mounts}
+    for kind, records in (("model", manifest.models), ("dataset", manifest.datasets)):
+        for name, record in records.items():
+            requirement_id = f"{kind}:{name}"
+            entry = entries.get(requirement_id)
+            mount = mounts.get((kind, name))
+            if entry is None:
+                errors.append(f"manifest_resource_not_locked:{requirement_id}")
+                continue
+            if mount is None:
+                errors.append(f"inventory_mount_missing:{requirement_id}")
+                continue
+            if record.sha256 != entry.artifact.digest or mount.sha256 != entry.artifact.digest:
+                errors.append(f"artifact_digest_mismatch:{requirement_id}")
+            if record.source != mount.source:
+                errors.append(f"artifact_source_mismatch:{requirement_id}")
+    return errors
 
 
 def collect_and_write_inventory(
@@ -33,6 +74,7 @@ def collect_and_write_inventory(
     spawn_mode: Optional[str] = None,
     env_sandbox_id: Optional[str] = None,
     exp_sandbox_id: Optional[str] = None,
+    resource_lock: Optional[ResourceLock] = None,
 ) -> EnvironmentInventory:
     """Probe the sandbox, write ``environment/`` artifacts, return inventory."""
     env_dir = run_dir / _ENV_DIR
@@ -112,7 +154,17 @@ def collect_and_write_inventory(
         image=image_rec,
         files=files,
         notes=notes,
+        resources_lock_digest=manifest.resources_lock_digest,
     )
+    if resource_lock is not None:
+        consistency_errors = validate_inventory_lock_consistency(
+            manifest, inventory, resource_lock,
+        )
+        if consistency_errors:
+            raise ValueError(
+                "resource lock/manifest/inventory mismatch: "
+                + ", ".join(consistency_errors)
+            )
 
     inv_path = env_dir / "inventory.json"
     inv_path.write_text(inventory.model_dump_json(indent=2) + "\n", encoding="utf-8")
@@ -160,6 +212,7 @@ def collect_and_write_inventory(
         "environment_md": str(md_path),
         "lineage": lineage,
         "manifest": manifest.model_dump(mode="json"),
+        "resources_lock_digest": manifest.resources_lock_digest,
         "image": image_rec.model_dump(exclude_none=True),
         "collected_at": time.time(),
     }
@@ -342,26 +395,52 @@ def _tools_from_manifest(
 ) -> list[ToolInventoryEntry]:
     out: list[ToolInventoryEntry] = []
     for name, t in manifest.tools.items():
-        version = t.version
-        path = None
         cmd = t.command or name
-        try:
-            r = manager.exec(
-                sandbox_id,
-                f"command -v {cmd} 2>/dev/null; {cmd} --version 2>/dev/null | head -1",
-                timeout=60,
-            )
-            lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
-            if lines:
-                path = lines[0]
-            if len(lines) > 1 and not version:
-                version = lines[1][:200]
-        except Exception:  # noqa: BLE001
-            pass
-        out.append(ToolInventoryEntry(
-            name=name, command=cmd, version=version, path=path, verified=t.verified,
+        out.append(_probe_tool(
+            manager, sandbox_id, name=name, command=cmd,
+            version=t.version, verified=t.verified,
         ))
+
+    declared = {entry.command or entry.name for entry in out}
+    for name, command in _BASELINE_TOOLS:
+        if command in declared:
+            continue
+        entry = _probe_tool(
+            manager, sandbox_id, name=name, command=command,
+            version=None, verified=False,
+        )
+        if entry.path:
+            out.append(entry)
     return out
+
+
+def _probe_tool(
+    manager: SandboxManager,
+    sandbox_id: str,
+    *,
+    name: str,
+    command: str,
+    version: Optional[str],
+    verified: bool,
+) -> ToolInventoryEntry:
+    path = None
+    try:
+        quoted = shlex.quote(command)
+        r = manager.exec(
+            sandbox_id,
+            f"command -v {quoted} 2>/dev/null; {quoted} --version 2>/dev/null | head -1",
+            timeout=60,
+        )
+        lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+        if lines:
+            path = lines[0]
+        if len(lines) > 1 and not version:
+            version = lines[1][:200]
+    except Exception:  # noqa: BLE001
+        pass
+    return ToolInventoryEntry(
+        name=name, command=command, version=version, path=path, verified=verified,
+    )
 
 
 def _packages_from_freeze(lines: list[str]) -> dict[str, str]:
